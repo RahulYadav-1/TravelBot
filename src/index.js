@@ -1,6 +1,6 @@
 /**
- * WhatsApp Travel Assistant Bot
- * Main entry point
+ * WhatsApp Travel Assistant Bot - TravelBuddy
+ * Enhanced with smart greetings, location awareness, and intelligent responses
  */
 
 import 'dotenv/config';
@@ -8,9 +8,17 @@ import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
 import qrcode from 'qrcode-terminal';
 import express from 'express';
-import { getTravelReply, handleLocation, getQueueStats } from './ai/gemini.js';
+import {
+  getTravelReply,
+  handleLocationReceived,
+  getWelcomeMessage,
+  getHelpMenu,
+  getFallbackMessage,
+  getQueueStats,
+} from './ai/gemini.js';
 import { TTLMap } from './util/ttlMap.js';
 import { deduplicator } from './util/dedupe.js';
+import { reverseGeocode, getLocationDisplay } from './util/geocoding.js';
 import logger from './util/logger.js';
 
 // =============================================================================
@@ -20,7 +28,7 @@ import logger from './util/logger.js';
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DATA_PATH = process.env.DATA_PATH || '/app/data';
 const USER_COOLDOWN_MS = parseInt(process.env.USER_COOLDOWN_MS, 10) || 2000;
-const USER_MEMORY_TTL = 30 * 60 * 1000; // 30 minutes
+const USER_MEMORY_TTL = 30 * 60 * 1000; // 30 minutes session
 
 // =============================================================================
 // State
@@ -30,8 +38,12 @@ let isReady = false;
 let client = null;
 const startTime = Date.now();
 
-// User memory: stores lastCity, lastIntent, lastLocationLatLng, lastSeenAt
+// User memory: stores session data
+// Structure: { locationData, lastIntent, preferences, isNewUser, firstSeenAt, sessionStartedAt }
 const userMemory = new TTLMap(USER_MEMORY_TTL);
+
+// Permanent user registry (to detect returning users) - longer TTL
+const userRegistry = new TTLMap(7 * 24 * 60 * 60 * 1000); // 7 days
 
 // User cooldowns: stores lastReplyAt timestamp
 const userCooldowns = new TTLMap(USER_COOLDOWN_MS * 2);
@@ -39,7 +51,61 @@ const userCooldowns = new TTLMap(USER_COOLDOWN_MS * 2);
 // Inflight requests: prevents multiple parallel replies to same user
 const inflightRequests = new Map();
 
-// Common city patterns for simple detection
+// =============================================================================
+// Intent Detection
+// =============================================================================
+
+const INTENTS = {
+  greeting: /^(hi|hello|hey|hola|start|begin|namaste|hii+)$/i,
+  help: /^(help|menu|options|commands|\?)$/i,
+  food: /\b(food|eat|restaurant|dining|cuisine|hungry|breakfast|lunch|dinner|cafe|coffee|snack|dessert|drink)\b/i,
+  attractions: /\b(visit|see|attraction|sightseeing|temple|museum|park|monument|landmark|tourist|explore|things to do)\b/i,
+  transport: /\b(transport|taxi|uber|ola|metro|bus|train|airport|auto|rickshaw|how to get|getting around|directions)\b/i,
+  shopping: /\b(shop|shopping|mall|market|buy|souvenir|store)\b/i,
+  safety: /\b(safe|safety|dangerous|scam|avoid|warning|crime|precaution)\b/i,
+  budget: /\b(cheap|budget|free|affordable|expensive|cost|price)\b/i,
+  thanks: /^(thanks|thank you|thx|ty|appreciated)$/i,
+};
+
+const PREFERENCES = {
+  vegetarian: /\b(veg|vegetarian|veggie|no meat|plant based)\b/i,
+  vegan: /\b(vegan)\b/i,
+  nonVeg: /\b(non-?veg|meat|chicken|fish|seafood)\b/i,
+  budgetFriendly: /\b(cheap|budget|affordable|low cost)\b/i,
+  premium: /\b(premium|luxury|expensive|high end|fine dining)\b/i,
+};
+
+/**
+ * Detect intent from message
+ */
+function detectIntent(text) {
+  for (const [intent, pattern] of Object.entries(INTENTS)) {
+    if (pattern.test(text)) {
+      return intent;
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect and extract preferences
+ */
+function detectPreferences(text) {
+  const prefs = {};
+
+  if (PREFERENCES.vegetarian.test(text)) prefs.dietaryRestriction = 'vegetarian';
+  else if (PREFERENCES.vegan.test(text)) prefs.dietaryRestriction = 'vegan';
+  else if (PREFERENCES.nonVeg.test(text)) prefs.dietaryRestriction = 'non-vegetarian';
+
+  if (PREFERENCES.budgetFriendly.test(text)) prefs.budget = 'budget-friendly';
+  else if (PREFERENCES.premium.test(text)) prefs.budget = 'premium';
+
+  return Object.keys(prefs).length > 0 ? prefs : null;
+}
+
+/**
+ * Detect city names in text
+ */
 const CITY_PATTERNS = [
   /\b(paris|london|tokyo|new york|rome|barcelona|amsterdam|berlin|dubai|singapore)\b/i,
   /\b(bangkok|bali|sydney|melbourne|toronto|vancouver|los angeles|san francisco)\b/i,
@@ -48,16 +114,16 @@ const CITY_PATTERNS = [
   /\b(miami|chicago|boston|seattle|denver|austin|nashville|new orleans)\b/i,
   /\b(rio|buenos aires|lima|bogota|mexico city|havana|cartagena)\b/i,
   /\b(marrakech|cape town|johannesburg|nairobi|zanzibar|mauritius)\b/i,
+  /\b(goa|jaipur|agra|varanasi|kolkata|chennai|bangalore|hyderabad|pune|ahmedabad)\b/i,
 ];
 
-// Intent patterns for simple detection
-const INTENT_PATTERNS = {
-  food: /\b(food|eat|restaurant|dining|cuisine|hungry|breakfast|lunch|dinner|cafe)\b/i,
-  activities: /\b(things to do|activities|attractions|sightseeing|visit|explore|tour)\b/i,
-  transport: /\b(transport|taxi|uber|metro|bus|train|airport|getting around)\b/i,
-  accommodation: /\b(hotel|hostel|stay|airbnb|accommodation|where to stay)\b/i,
-  safety: /\b(safe|safety|dangerous|scam|avoid|warning)\b/i,
-};
+function detectCity(text) {
+  for (const pattern of CITY_PATTERNS) {
+    const match = text.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
 
 // =============================================================================
 // WhatsApp Client Setup
@@ -99,7 +165,6 @@ function createClient() {
   // QR Code event
   client.on('qr', (qr) => {
     logger.info('QR Code received - scan with WhatsApp');
-    // Log QR as text for Render logs (can scan from any QR reader)
     logger.info('QR_DATA:' + qr);
     qrcode.generate(qr, { small: true }, (qrString) => {
       console.log('\n========== SCAN THIS QR CODE ==========\n');
@@ -206,7 +271,6 @@ async function handleMessage(msg) {
     // Check if there's already an inflight request for this user
     if (inflightRequests.has(userId)) {
       logger.debug('User has inflight request, queuing', { userId });
-      // Queue this request to process after current one finishes
       const currentPromise = inflightRequests.get(userId);
       inflightRequests.set(
         userId,
@@ -246,16 +310,31 @@ async function processMessage(msg) {
     }
   }
 
-  // Get/update user context
+  // Get or create user context
   let userContext = userMemory.get(userId) || {};
-  userContext.lastSeenAt = Date.now();
+  const isFirstEverMessage = !userRegistry.has(userId);
+
+  // Initialize new session if needed
+  if (!userContext.sessionStartedAt) {
+    userContext = {
+      ...userContext,
+      sessionStartedAt: Date.now(),
+      isNewUser: isFirstEverMessage,
+    };
+
+    // Register user
+    if (isFirstEverMessage) {
+      userRegistry.set(userId, { firstSeenAt: Date.now() });
+      logger.info('New user registered', { userId });
+    }
+  }
 
   let reply;
 
   // Handle different message types
   switch (msg.type) {
     case 'chat': // Text message
-      reply = await handleTextMessage(msg, userContext);
+      reply = await handleTextMessage(msg, userContext, isFirstEverMessage);
       break;
 
     case 'location':
@@ -263,7 +342,7 @@ async function processMessage(msg) {
       break;
 
     default:
-      reply = await handleUnsupportedMessage(msg);
+      reply = handleUnsupportedMessage(msg);
       break;
   }
 
@@ -271,8 +350,6 @@ async function processMessage(msg) {
   if (reply) {
     await msg.reply(reply);
     userCooldowns.set(userId, Date.now());
-
-    // Update user memory
     userMemory.set(userId, userContext);
 
     logger.info('Sent reply', {
@@ -282,27 +359,60 @@ async function processMessage(msg) {
   }
 }
 
-async function handleTextMessage(msg, userContext) {
+async function handleTextMessage(msg, userContext, isFirstEverMessage) {
   const text = msg.body?.trim();
 
   if (!text) {
-    return "I didn't catch that. Could you send me a text message about your travel question?";
+    return getFallbackMessage(!!userContext.locationData);
   }
 
-  // Update context with detected city
+  // Detect intent
+  const intent = detectIntent(text);
   const detectedCity = detectCity(text);
+  const detectedPrefs = detectPreferences(text);
+
+  // Update context
+  if (intent && intent !== 'greeting' && intent !== 'help' && intent !== 'thanks') {
+    userContext.lastIntent = intent;
+  }
   if (detectedCity) {
     userContext.lastCity = detectedCity;
-    logger.debug('Detected city', { city: detectedCity });
+  }
+  if (detectedPrefs) {
+    userContext.preferences = { ...userContext.preferences, ...detectedPrefs };
   }
 
-  // Update context with detected intent
-  const detectedIntent = detectIntent(text);
-  if (detectedIntent) {
-    userContext.lastIntent = detectedIntent;
-    logger.debug('Detected intent', { intent: detectedIntent });
+  logger.debug('Message analysis', { intent, detectedCity, detectedPrefs });
+
+  // Handle special intents
+  if (intent === 'greeting') {
+    // Check if this is truly the first message ever or just a new session
+    if (isFirstEverMessage && !userContext.hasReceivedWelcome) {
+      userContext.hasReceivedWelcome = true;
+      return getWelcomeMessage({
+        isNewUser: true,
+        hasLocation: !!userContext.locationData,
+        locationData: userContext.locationData,
+      });
+    } else {
+      return getWelcomeMessage({
+        isNewUser: false,
+        hasLocation: !!userContext.locationData,
+        locationData: userContext.locationData,
+      });
+    }
   }
 
+  if (intent === 'help') {
+    const locationDisplay = getLocationDisplay(userContext.locationData);
+    return getHelpMenu(locationDisplay);
+  }
+
+  if (intent === 'thanks') {
+    return "You're welcome! 😊 Let me know if you need anything else. Happy exploring!";
+  }
+
+  // For regular queries, use Gemini
   return getTravelReply({ text, userContext });
 }
 
@@ -314,19 +424,29 @@ async function handleLocationMessage(msg, userContext) {
   }
 
   const { latitude, longitude } = location;
+  const isUpdate = !!userContext.locationData;
 
-  // Store location in user context
-  userContext.lastLocationLatLng = { lat: latitude, lng: longitude };
-
-  logger.info('Received location', {
+  logger.info('Processing location', {
     lat: latitude.toFixed(4),
     lng: longitude.toFixed(4),
+    isUpdate,
   });
 
-  return handleLocation({ latitude, longitude, userContext });
+  // Reverse geocode the location
+  const locationData = await reverseGeocode(latitude, longitude);
+
+  // Update user context
+  userContext.locationData = locationData;
+
+  // Generate response
+  return handleLocationReceived({
+    locationData,
+    userContext,
+    isUpdate,
+  });
 }
 
-async function handleUnsupportedMessage(msg) {
+function handleUnsupportedMessage(msg) {
   const typeDescriptions = {
     image: 'image',
     video: 'video',
@@ -339,31 +459,18 @@ async function handleUnsupportedMessage(msg) {
 
   const typeName = typeDescriptions[msg.type] || 'that type of message';
 
-  return `Thanks for the ${typeName}! For now, I can only help with text messages and location shares. Feel free to describe your travel question in a text message, or share your location if you're looking for nearby recommendations!`;
+  return `Thanks for the ${typeName}! 📱
+
+For now, I work best with:
+💬 Text messages - Ask me anything about travel
+📍 Location - Share your location for local recommendations
+
+How can I help with your travel plans?`;
 }
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-function detectCity(text) {
-  for (const pattern of CITY_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) {
-      return match[1];
-    }
-  }
-  return null;
-}
-
-function detectIntent(text) {
-  for (const [intent, pattern] of Object.entries(INTENT_PATTERNS)) {
-    if (pattern.test(text)) {
-      return intent;
-    }
-  }
-  return null;
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -376,7 +483,7 @@ function sleep(ms) {
 const app = express();
 
 app.get('/', (req, res) => {
-  res.send('WhatsApp Travel Bot is running');
+  res.send('TravelBuddy WhatsApp Bot is running! 🌍');
 });
 
 app.get('/health', (req, res) => {
@@ -388,7 +495,8 @@ app.get('/health', (req, res) => {
     uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
     timestamp: new Date().toISOString(),
     stats: {
-      activeUsers: userMemory.size,
+      activeSessions: userMemory.size,
+      registeredUsers: userRegistry.size,
       dedupeEntries: deduplicator.size,
       aiQueue: queueStats,
     },
@@ -402,12 +510,10 @@ app.get('/health', (req, res) => {
 async function shutdown(signal) {
   logger.info('Shutdown signal received', { signal });
 
-  // Clear reconnect timeout
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
   }
 
-  // Destroy client
   if (client) {
     try {
       await client.destroy();
@@ -417,8 +523,8 @@ async function shutdown(signal) {
     }
   }
 
-  // Clean up TTL maps
   userMemory.destroy();
+  userRegistry.destroy();
   deduplicator.destroy();
 
   logger.info('Cleanup complete, exiting');
@@ -428,7 +534,6 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Handle uncaught errors
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception', {
     error: error.message,
@@ -437,7 +542,7 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', {
     reason: reason?.message || reason,
   });
@@ -448,19 +553,17 @@ process.on('unhandledRejection', (reason, promise) => {
 // =============================================================================
 
 async function main() {
-  logger.info('Starting WhatsApp Travel Bot', {
+  logger.info('Starting TravelBuddy WhatsApp Bot', {
     nodeVersion: process.version,
     port: PORT,
     dataPath: DATA_PATH,
     cooldownMs: USER_COOLDOWN_MS,
   });
 
-  // Start Express server
   app.listen(PORT, '0.0.0.0', () => {
     logger.info('Health server listening', { port: PORT });
   });
 
-  // Create and initialize WhatsApp client
   client = createClient();
 
   try {
