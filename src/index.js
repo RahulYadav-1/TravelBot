@@ -99,8 +99,12 @@ function createClient() {
   // QR Code event
   client.on('qr', (qr) => {
     logger.info('QR Code received - scan with WhatsApp');
+    // Log QR as text for Render logs (can scan from any QR reader)
+    logger.info('QR_DATA:' + qr);
     qrcode.generate(qr, { small: true }, (qrString) => {
-      logger.qr(qrString);
+      console.log('\n========== SCAN THIS QR CODE ==========\n');
+      console.log(qrString);
+      console.log('\n========================================\n');
     });
   });
 
