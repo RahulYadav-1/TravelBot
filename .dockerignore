@@ -1,28 +1,4 @@
-# Dependencies (will be installed in container)
-node_modules/
-
-# Git
-.git/
-.gitignore
-
-# Environment (set via Railway)
+node_modules
+.git
 .env
-.env.*
-
-# Session data (use volume)
-.wwebjs_auth/
-.wwebjs_cache/
-data/
-
-# Documentation
-README.md
-*.md
-
-# Development
-.vscode/
-.idea/
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
+data
