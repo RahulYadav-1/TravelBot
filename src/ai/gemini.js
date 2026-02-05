@@ -1,6 +1,6 @@
 /**
- * Gemini AI Integration for Travel Assistant
- * Enhanced with location context and smart responses
+ * Gemini AI Integration for TravelBuddy
+ * Enhanced with conversation memory, weather, and intelligent responses
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -12,7 +12,6 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const AI_CONCURRENCY = parseInt(process.env.AI_CONCURRENCY, 10) || 3;
 const MAX_RESPONSE_LENGTH = 1200;
-const SUMMARIZE_TARGET_LENGTH = 900;
 
 if (!GEMINI_API_KEY) {
   logger.error('GEMINI_API_KEY is required');
@@ -23,302 +22,432 @@ if (!GEMINI_API_KEY) {
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
-// Concurrency queue for API calls
+// Concurrency queue
 const queue = new PQueue({ concurrency: AI_CONCURRENCY });
 
-// Enhanced system instruction for travel assistant
-const SYSTEM_INSTRUCTION = `You are TravelBuddy, a friendly and knowledgeable WhatsApp travel assistant. You help tourists discover the best of any city - food, attractions, transport, and local tips.
+// =============================================================================
+// MASTER SYSTEM PROMPT - The brain of the bot
+// =============================================================================
 
-PERSONALITY:
-- Warm, helpful, and enthusiastic about travel
-- Speak like a knowledgeable local friend
-- Use emojis sparingly for visual appeal (1-3 per message)
-- Be concise - WhatsApp users prefer short, scannable messages
+const SYSTEM_PROMPT = `You are TravelBuddy - a smart, friendly travel assistant chatting on WhatsApp. You help tourists discover the best of any city.
 
-RESPONSE FORMAT:
-- Use bullet points for lists
-- Keep responses under 800 characters when possible
-- Always end with a follow-up question to keep conversation going
-- Use simple formatting that works in WhatsApp
+## YOUR PERSONALITY
+- Talk like a knowledgeable local friend, NOT a guidebook
+- Be warm, casual, and genuinely helpful
+- Use natural language: "tbh", "btw", "rn" (right now), "gonna"
+- React to users: "oh nice!", "ah got it", "hmm let me think"
+- Vary your openings - NEVER start the same way twice
+- Use 1-2 emojis max per message, not more
 
-IMPORTANT RULES:
-1. NEVER invent specific business names, addresses, or phone numbers
-2. Instead, describe TYPES of places and WHERE to look for them
-3. Say "look for" or "search for" instead of "go to [specific place]"
-4. Suggest users verify on Google Maps for exact locations
-5. Be honest about limitations - you provide guidance, not exact listings
+## CRITICAL RULES
 
-FOR FOOD RECOMMENDATIONS:
-- Describe cuisine types and what to expect
-- Mention areas/streets known for that food
-- Give tips on what to order or ask for
-- Suggest price range expectations
+### 1. NEVER REPEAT GREETINGS
+- First message: Full welcome
+- After that: Jump straight to helping
+- NEVER say "Hello!", "Hey!", "Namaste!" after first message
+- NEVER start with "Great question!" or similar
 
-FOR ATTRACTIONS:
-- Describe what makes it worth visiting
-- Mention approximate walking/travel time from user's location
-- Give best time to visit tips
-- Suggest combining nearby attractions
+### 2. CONVERSATION CONTINUITY
+- Reference what was discussed: "Since you mentioned budget..."
+- Remember preferences: "You're vegetarian right, so..."
+- Build on previous: "Near that area you liked..."
+- If user says "more" → more of same thing
+- If user says "different" → change category
+- If user says "cheaper" → budget alternatives
+- If user says "closer" → nearer options
+- If user says "again" → repeat last suggestion
 
-FOR TRANSPORT:
-- Explain available options (metro, bus, taxi, auto)
-- Give general direction and route guidance
-- Mention apps to use (Uber, local metro apps)
-- Warn about common tourist transport scams
+### 3. RESPONSE LENGTH
+- Short by default (under 500 chars)
+- Only longer if user asks for details
+- Quick questions get quick answers
+- Lists: max 3-4 items unless asked for more
 
-FOR SAFETY:
-- Be honest but not alarmist
-- Give practical tips specific to the area
-- Mention what to watch out for
-- Suggest safe practices
+### 4. NEVER INVENT SPECIFICS
+- NO made-up restaurant/shop names
+- NO fake addresses or phone numbers
+- Say "look for" not "go to [specific place]"
+- Use: "Search on Google Maps for..."
+- Be honest: "I can suggest what to look for..."
 
-TIME AWARENESS:
-- Morning (6-11 AM): Suggest breakfast spots, early attractions
-- Afternoon (11 AM-4 PM): Lunch, indoor activities if hot, sightseeing
-- Evening (4-8 PM): Sunset spots, dinner areas, markets
-- Night (8 PM-12 AM): Nightlife areas, safe late-night food
-- Late night (12-6 AM): Mention most places closed, suggest 24/7 options
+## SMART BEHAVIORS
 
-ALWAYS:
-- Acknowledge the user's location when relevant
-- Ask clarifying questions (budget, cuisine preference, walking vs transport)
-- Provide actionable next steps
-- Be culturally sensitive and respectful`;
+### Time Awareness (time provided in context)
+- 6-10 AM: Breakfast mode, fresh start energy
+- 11 AM-3 PM: Lunch suggestions, indoor if hot
+- 3-6 PM: Snack time, evening planning
+- 6-9 PM: Dinner mode, nightlife preview
+- 9 PM-12 AM: Late dining, safety conscious
+- 12-6 AM: "Most places closed, here's what's open 24/7..."
 
-/**
- * Get current time period for context
- */
-function getTimePeriod() {
-  const hour = new Date().getHours();
+### Weather Awareness (weather provided in context)
+- Hot (>35°C): Suggest AC places, hydration, avoid midday outdoor
+- Rainy: Indoor alternatives, "good day for museums/malls"
+- Pleasant: Encourage walking, outdoor activities
+- Cold: Warm food suggestions, layering tips
 
-  if (hour >= 6 && hour < 11) return { period: 'morning', description: 'Morning time' };
-  if (hour >= 11 && hour < 16) return { period: 'afternoon', description: 'Afternoon' };
-  if (hour >= 16 && hour < 20) return { period: 'evening', description: 'Evening time' };
-  if (hour >= 20 || hour < 1) return { period: 'night', description: 'Night time' };
-  return { period: 'late_night', description: 'Late night' };
-}
+### Budget Detection
+- "cheap/budget/free" → Backpacker mode
+- "best/luxury/premium" → High-end suggestions
+- No mention → Mid-range default
 
-/**
- * Build context-rich prompt for Gemini
- */
-function buildPrompt({ text, userContext }) {
+### Travel Style
+- "we/friends/family" → Group-friendly spots
+- Solo language → Solo-safe suggestions
+- "kids/children" → Family-friendly only
+- "party/drinks" → Nightlife mode
+
+## SPECIAL RESPONSES
+
+### For "how to reach X"
+Give transport options with:
+- Time estimate
+- Cost range (use ₹ for India, $ for US, etc.)
+- Best option based on time/context
+- Traffic consideration if evening
+
+### For Food
+- Mention cuisine TYPE not specific restaurants
+- Areas known for that food
+- What to look for / ask for
+- Price range expectation
+- Time relevance (breakfast spot vs dinner)
+
+### For Attractions
+- What makes it worth visiting
+- Time needed
+- Best time to go
+- Nearby combos
+- Photo spot hints
+
+### For Safety Queries
+Be helpful but not alarmist:
+- Practical tips
+- Common tourist scams in that area
+- What to avoid
+- Emergency numbers if serious concern
+
+### Quick Itinerary (when asked)
+Format:
+"Here's a quick plan:
+→ Now: [activity] (X min)
+→ Then: [activity] (X min)
+→ After: [activity] (X min)
+Total: ~X hours. Adjust?"
+
+## PROACTIVE INTELLIGENCE
+
+Add naturally when relevant:
+- Late night → "btw Uber is safer than street autos this late"
+- Tourist area → "heads up - ignore anyone offering 'free' tours"
+- Meal time approaching → "getting close to lunch, want food recs?"
+- After attraction → "there's good street food near there btw"
+- User frustrated → acknowledge, simplify, offer alternatives
+
+## FORMATTING FOR WHATSAPP
+
+- Short paragraphs
+- *bold* for emphasis (sparingly)
+- Line breaks between sections
+- NO markdown headers (#)
+- NO long bullet lists (max 4 items)
+- NO numbered lists for simple things
+- Emojis: 1-2 per message max
+
+## EXAMPLE GOOD RESPONSES
+
+User: "hungry"
+Bad: "Hello! I'd be happy to help you find food options! Here are some great choices..."
+Good: "What are you in the mood for? Quick street food or proper sit-down meal?"
+
+User: "chinese food"
+Bad: "Great choice! Here are the top Chinese restaurants..."
+Good: "For Chinese near you, look around [area] - lots of options from quick noodle shops to proper restaurants. Budget or splurge?"
+
+User: "more"
+Bad: "I'd be happy to provide more options! Here are additional suggestions..."
+Good: "Alright, also check out [different area] - different vibe but good options. Or want something totally different?"
+
+User: "thanks"
+Bad: "You're welcome! Is there anything else I can help you with today?"
+Good: "Anytime! Enjoy 🙌"
+
+Remember: Sound human, be helpful, keep it short.`;
+
+// =============================================================================
+// CONTEXT BUILDER
+// =============================================================================
+
+function buildContext(userContext) {
   const parts = [];
-  const timeInfo = getTimePeriod();
+  const now = new Date();
+  const hour = now.getHours();
 
-  // Add location context
-  if (userContext?.locationData?.fullAddress) {
-    parts.push(`📍 User's Location: ${userContext.locationData.fullAddress}`);
-    if (userContext.locationData.coordinates) {
-      parts.push(`   Coordinates: ${userContext.locationData.coordinates.lat.toFixed(4)}, ${userContext.locationData.coordinates.lng.toFixed(4)}`);
-    }
-  } else if (userContext?.lastCity) {
-    parts.push(`📍 User mentioned city: ${userContext.lastCity}`);
+  // Time context
+  let timeOfDay;
+  if (hour >= 6 && hour < 11) timeOfDay = 'Morning';
+  else if (hour >= 11 && hour < 15) timeOfDay = 'Afternoon (lunch time)';
+  else if (hour >= 15 && hour < 18) timeOfDay = 'Late afternoon';
+  else if (hour >= 18 && hour < 21) timeOfDay = 'Evening (dinner time)';
+  else if (hour >= 21 || hour < 1) timeOfDay = 'Night';
+  else timeOfDay = 'Late night (most places closed)';
+
+  parts.push(`🕐 TIME: ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} - ${timeOfDay}`);
+
+  // Location context
+  if (userContext.locationData?.fullAddress) {
+    parts.push(`📍 LOCATION: ${userContext.locationData.fullAddress}`);
+  } else if (userContext.lastCity) {
+    parts.push(`📍 CITY: ${userContext.lastCity}`);
   } else {
-    parts.push(`📍 Location: Not shared yet`);
+    parts.push(`📍 LOCATION: Not shared yet`);
   }
 
-  // Add time context
-  parts.push(`🕐 Current time: ${timeInfo.description} (${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })})`);
-
-  // Add user preferences if known
-  if (userContext?.preferences) {
-    const prefs = [];
-    if (userContext.preferences.budget) prefs.push(`Budget: ${userContext.preferences.budget}`);
-    if (userContext.preferences.dietaryRestriction) prefs.push(`Diet: ${userContext.preferences.dietaryRestriction}`);
-    if (prefs.length > 0) {
-      parts.push(`👤 Preferences: ${prefs.join(', ')}`);
-    }
+  // Weather context
+  if (userContext.weather) {
+    const w = userContext.weather;
+    parts.push(`🌤️ WEATHER: ${w.temperature}°C, ${w.condition} ${w.icon}`);
   }
 
-  // Add last intent for continuity
-  if (userContext?.lastIntent) {
-    parts.push(`💭 Previous interest: ${userContext.lastIntent}`);
+  // User profile
+  const profile = [];
+  if (userContext.preferences?.budget) profile.push(`Budget: ${userContext.preferences.budget}`);
+  if (userContext.preferences?.dietaryRestriction) profile.push(`Diet: ${userContext.preferences.dietaryRestriction}`);
+  if (userContext.travelStyle) profile.push(`Style: ${userContext.travelStyle}`);
+  if (profile.length > 0) {
+    parts.push(`👤 USER: ${profile.join(', ')}`);
   }
 
-  // Add conversation state
-  if (userContext?.isNewUser) {
-    parts.push(`ℹ️ This is a NEW user - be extra welcoming`);
+  // Session info
+  parts.push(`💬 MESSAGE #${userContext.messageCount || 1} in session`);
+  if (userContext.hasGreeted) {
+    parts.push(`⚠️ ALREADY GREETED - Do NOT say hello/welcome again`);
   }
 
-  parts.push('');
-  parts.push(`User message: ${text}`);
+  // Conversation history
+  if (userContext.conversationHistory?.length > 0) {
+    parts.push(`\n📝 RECENT CONVERSATION:`);
+    userContext.conversationHistory.slice(-6).forEach(msg => {
+      const role = msg.role === 'user' ? 'User' : 'You';
+      const text = msg.text.length > 100 ? msg.text.substring(0, 100) + '...' : msg.text;
+      parts.push(`${role}: ${text}`);
+    });
+  }
+
+  // Saved places
+  if (userContext.savedPlaces?.length > 0) {
+    parts.push(`\n📌 USER'S SAVED PLACES: ${userContext.savedPlaces.join(', ')}`);
+  }
+
+  // Last topic for continuity
+  if (userContext.lastTopic) {
+    parts.push(`\n💭 LAST TOPIC: ${userContext.lastTopic}`);
+  }
 
   return parts.join('\n');
 }
 
-/**
- * Summarize a response that's too long
- */
-async function summarizeResponse(text) {
-  logger.debug('Summarizing long response', { originalLength: text.length });
+// =============================================================================
+// MAIN REPLY FUNCTION
+// =============================================================================
 
-  const summarizePrompt = `Summarize this travel info to under ${SUMMARIZE_TARGET_LENGTH} characters. Keep the most useful details, emojis, and the follow-up question:\n\n${text}`;
-
-  const result = await model.generateContent(summarizePrompt);
-  const response = result.response;
-  const summarized = response.text().trim();
-
-  logger.debug('Summarized response', { newLength: summarized.length });
-  return summarized;
-}
-
-/**
- * Get a travel-related reply from Gemini
- */
 export async function getTravelReply({ text, userContext }) {
   return queue.add(async () => {
     try {
-      logger.debug('Generating travel reply', {
-        textLength: text?.length,
-        hasLocation: !!userContext?.locationData,
-      });
+      const context = buildContext(userContext);
 
-      const prompt = buildPrompt({ text, userContext });
+      const prompt = `${context}
+
+---
+USER'S MESSAGE: ${text}
+---
+
+Respond naturally as TravelBuddy. Remember the rules.`;
+
+      logger.debug('Sending to Gemini', {
+        messageCount: userContext.messageCount,
+        hasLocation: !!userContext.locationData,
+        textLength: text.length
+      });
 
       const chat = model.startChat({
         history: [
-          {
-            role: 'user',
-            parts: [{ text: 'You are TravelBuddy. Follow these instructions for all responses:' }],
-          },
-          {
-            role: 'model',
-            parts: [{ text: SYSTEM_INSTRUCTION }],
-          },
+          { role: 'user', parts: [{ text: 'You are TravelBuddy. Here are your instructions:' }] },
+          { role: 'model', parts: [{ text: SYSTEM_PROMPT }] },
         ],
       });
 
       const result = await chat.sendMessage(prompt);
-      const response = result.response;
-      let reply = response.text().trim();
+      let reply = result.response.text().trim();
 
-      // Check if response is too long
+      // Truncate if too long
       if (reply.length > MAX_RESPONSE_LENGTH) {
-        reply = await summarizeResponse(reply);
-        if (reply.length > MAX_RESPONSE_LENGTH) {
-          reply = reply.substring(0, MAX_RESPONSE_LENGTH - 3) + '...';
+        // Try to cut at a sentence
+        const truncated = reply.substring(0, MAX_RESPONSE_LENGTH);
+        const lastSentence = truncated.lastIndexOf('. ');
+        if (lastSentence > MAX_RESPONSE_LENGTH * 0.7) {
+          reply = truncated.substring(0, lastSentence + 1);
+        } else {
+          reply = truncated + '...';
         }
       }
 
-      logger.debug('Generated reply', { replyLength: reply.length });
+      logger.debug('Gemini response', { replyLength: reply.length });
       return reply;
+
     } catch (error) {
-      logger.error('Gemini API error', {
-        error: error.message,
-        code: error.code,
-      });
+      logger.error('Gemini API error', { error: error.message });
 
       if (error.message?.includes('quota')) {
-        return "I'm getting a lot of questions right now! Please try again in a moment. 🙏";
+        return "I'm getting a lot of questions rn! Try again in a sec 🙏";
       }
-
       if (error.message?.includes('safety')) {
-        return "I can only help with travel-related questions. What would you like to know about this area? 🗺️";
+        return "I can only help with travel stuff. What do you want to explore?";
       }
-
-      return "Sorry, I couldn't process that. Could you try asking in a different way? 🤔";
+      return "Hmm something went wrong. Try asking differently?";
     }
   });
 }
 
+// =============================================================================
+// SPECIAL HANDLERS
+// =============================================================================
+
 /**
- * Handle location-based queries with geocoded data
+ * Handle location received
  */
 export async function handleLocationReceived({ locationData, userContext, isUpdate }) {
-  const locationDisplay = locationData?.fullAddress || 'your location';
+  const location = locationData?.fullAddress || 'your area';
 
-  const contextMessage = isUpdate
-    ? `User just UPDATED their location to: ${locationDisplay}. Acknowledge the update briefly and ask what they'd like to explore in this new area.`
-    : `User just shared their location: ${locationDisplay}. This is their first location share. Welcome them to the area and offer to help with: food, attractions, transport, or shopping. Keep it brief and friendly.`;
+  if (isUpdate) {
+    return getTravelReply({
+      text: `[SYSTEM: User updated location to ${location}. Briefly acknowledge the new location and ask what they want to explore here. Keep it short.]`,
+      userContext: { ...userContext, locationData },
+    });
+  }
 
   return getTravelReply({
-    text: contextMessage,
+    text: `[SYSTEM: User just shared location: ${location}. Welcome them to this area briefly. Mention you can help with food, attractions, transport. Ask what they're looking for. Keep it conversational and short.]`,
     userContext: { ...userContext, locationData },
   });
 }
 
 /**
- * Generate welcome message for new users
+ * Welcome message for first-time users
  */
-export async function getWelcomeMessage({ isNewUser, hasLocation, locationData }) {
-  if (isNewUser) {
-    let message = `Hey there! 👋 I'm TravelBuddy, your personal travel assistant.
+export function getWelcomeMessage({ hasLocation, locationData }) {
+  let msg = `Hey! 👋 I'm TravelBuddy - your travel assistant.
 
-I can help you discover:
-🍽️ Great food & restaurants
-🏛️ Attractions & things to do
-🚕 Transport & getting around
+I help you find:
+🍽️ Food & restaurants
+🏛️ Things to see & do
+🚕 Getting around
 🛍️ Shopping spots
 
 `;
-    if (hasLocation && locationData?.fullAddress) {
-      message += `I see you're near *${locationData.fullAddress}*! What would you like to explore?`;
-    } else {
-      message += `Share your location and I'll give you personalized recommendations for your area!
 
-Tap ➕ → 📍 Location → Send your current location`;
-    }
-    return message;
-  }
-
-  // Returning user
   if (hasLocation && locationData?.fullAddress) {
-    return `Welcome back! 👋 You're near *${locationData.fullAddress}*. What can I help you find today?`;
+    msg += `I see you're near *${locationData.fullAddress}*. What would you like to explore?`;
+  } else {
+    msg += `Share your location and I'll give you personalized recs for your area!
+
+Tap ➕ → 📍 Location → Send location`;
   }
 
-  return `Welcome back! 👋 Ready to explore? Share your location or tell me what you're looking for!`;
+  return msg;
 }
 
 /**
- * Generate help menu
+ * Welcome back message for returning users
+ */
+export function getWelcomeBackMessage({ hasLocation, locationData }) {
+  if (hasLocation && locationData?.fullAddress) {
+    return `Hey, welcome back! 👋 You're near *${locationData.fullAddress}*. What can I help you find?`;
+  }
+  return `Welcome back! 👋 Share your location or tell me what you're looking for today.`;
+}
+
+/**
+ * Help menu
  */
 export function getHelpMenu(locationDisplay) {
-  let menu = `📍 *TravelBuddy Menu*
+  let menu = `*TravelBuddy Commands*
 
-I can help you with:
-
-🍽️ *Food* - Say "hungry" or "food"
-🏛️ *Attractions* - Say "visit" or "see"
-🚕 *Transport* - Say "taxi" or "metro"
-🛍️ *Shopping* - Say "shop" or "market"
-⚠️ *Safety* - Say "safety tips"
-📍 *Update Location* - Share new location
+Just type naturally! Or try:
+• "hungry" - food options
+• "what to see" - attractions
+• "how to reach X" - transport help
+• "save this" - bookmark a suggestion
+• "my saves" - see your bookmarks
+• "cheaper/closer/more" - refine suggestions
 
 `;
   if (locationDisplay) {
-    menu += `Currently helping you at: *${locationDisplay}*\n\n`;
+    menu += `📍 Your location: ${locationDisplay}\n`;
   }
-  menu += `What would you like to explore?`;
+  menu += `\nWhat do you need?`;
   return menu;
 }
 
 /**
- * Generate fallback message
+ * Emergency response
  */
-export function getFallbackMessage(hasLocation) {
-  if (!hasLocation) {
-    return `I'm not sure I understood that. 🤔
+export function getEmergencyResponse(country = 'India') {
+  const emergencyNumbers = {
+    'India': {
+      police: '100',
+      ambulance: '102',
+      fire: '101',
+      women: '1091',
+      tourist: '1363',
+    },
+    'default': {
+      police: '911',
+      ambulance: '911',
+    }
+  };
 
-To help you better, please:
-📍 Share your location (tap ➕ → Location)
-OR
-💬 Ask about food, attractions, or transport
+  const numbers = emergencyNumbers[country] || emergencyNumbers['default'];
 
-Type "help" for all options!`;
-  }
+  let response = `🚨 *Emergency Numbers*\n\n`;
+  response += `🚔 Police: ${numbers.police}\n`;
+  response += `🚑 Ambulance: ${numbers.ambulance}\n`;
+  if (numbers.fire) response += `🚒 Fire: ${numbers.fire}\n`;
+  if (numbers.women) response += `👩 Women Helpline: ${numbers.women}\n`;
+  if (numbers.tourist) response += `🧳 Tourist Helpline: ${numbers.tourist}\n`;
+  response += `\nAre you safe? What's happening?`;
 
-  return `I didn't quite catch that. 🤔
-
-Try asking about:
-• "Where can I eat nearby?"
-• "What's worth visiting?"
-• "How do I get around?"
-
-Or type "help" to see all options!`;
+  return response;
 }
 
 /**
- * Get queue stats
+ * Saved places response
+ */
+export function getSavedPlacesResponse(savedPlaces) {
+  if (!savedPlaces || savedPlaces.length === 0) {
+    return `You haven't saved anything yet!\n\nWhen I suggest something, say "save this" to bookmark it.`;
+  }
+
+  let response = `📌 *Your Saved Places*\n\n`;
+  savedPlaces.forEach((place, i) => {
+    response += `${i + 1}. ${place}\n`;
+  });
+  response += `\nWant details on any of these?`;
+  return response;
+}
+
+/**
+ * Fallback message
+ */
+export function getFallbackMessage(hasLocation) {
+  if (!hasLocation) {
+    return `Not sure I got that 🤔\n\nShare your 📍 location or ask about food, places to visit, or transport!`;
+  }
+  return `Didn't catch that. Try asking about food, attractions, or transport - or type "help" for options.`;
+}
+
+/**
+ * Queue stats
  */
 export function getQueueStats() {
   return {
@@ -332,7 +461,10 @@ export default {
   getTravelReply,
   handleLocationReceived,
   getWelcomeMessage,
+  getWelcomeBackMessage,
   getHelpMenu,
+  getEmergencyResponse,
+  getSavedPlacesResponse,
   getFallbackMessage,
   getQueueStats,
 };
