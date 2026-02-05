@@ -72,6 +72,7 @@ function createClient() {
     }),
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -79,6 +80,7 @@ function createClient() {
         '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
+        '--single-process',
         '--disable-extensions',
         '--disable-background-networking',
         '--disable-sync',
@@ -87,6 +89,9 @@ function createClient() {
         '--mute-audio',
         '--no-default-browser-check',
         '--safebrowsing-disable-auto-update',
+        '--disable-software-rasterizer',
+        '--disable-crash-reporter',
+        '--disable-breakpad',
       ],
     },
   });
