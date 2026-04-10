@@ -1,14 +1,20 @@
 /**
  * WhatsApp Travel Assistant Bot - TravelBuddy
+ * Using Baileys for reliable WhatsApp connection
  * Enhanced with smart greetings, location awareness, weather, conversation memory,
  * quick actions, save/bookmark, emergency detection, and intelligent responses
  */
 
 import 'dotenv/config';
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeInMemoryStore,
+  fetchLatestBaileysVersion,
+} from 'baileys';
 import qrcode from 'qrcode-terminal';
 import express from 'express';
+import pino from 'pino';
 import {
   getTravelReply,
   handleLocationReceived,
@@ -23,7 +29,7 @@ import {
 import { TTLMap } from './util/ttlMap.js';
 import { deduplicator } from './util/dedupe.js';
 import { reverseGeocode, getLocationDisplay } from './util/geocoding.js';
-import { getWeather, getWeatherSuggestion } from './util/weather.js';
+import { getWeather } from './util/weather.js';
 import logger from './util/logger.js';
 
 // =============================================================================
@@ -36,12 +42,15 @@ const USER_COOLDOWN_MS = parseInt(process.env.USER_COOLDOWN_MS, 10) || 2000;
 const USER_MEMORY_TTL = 30 * 60 * 1000; // 30 minutes session
 const MAX_CONVERSATION_HISTORY = 10; // Store last 10 messages
 
+// Baileys logger (silent to reduce noise)
+const baileysLogger = pino({ level: 'silent' });
+
 // =============================================================================
 // State
 // =============================================================================
 
 let isReady = false;
-let client = null;
+let sock = null;
 const startTime = Date.now();
 
 // User memory: stores session data including conversation history
@@ -55,6 +64,9 @@ const userCooldowns = new TTLMap(USER_COOLDOWN_MS * 2);
 
 // Inflight requests: prevents multiple parallel replies to same user
 const inflightRequests = new Map();
+
+// Store for message history (optional, helps with some features)
+const store = makeInMemoryStore({ logger: baileysLogger });
 
 // =============================================================================
 // Intent & Pattern Detection
@@ -267,109 +279,84 @@ function saveLastSuggestion(userContext) {
 }
 
 // =============================================================================
-// WhatsApp Client Setup
+// Baileys WhatsApp Connection
 // =============================================================================
 
-function createClient() {
-  logger.info('Creating WhatsApp client', { dataPath: DATA_PATH });
+async function connectToWhatsApp() {
+  const authPath = `${DATA_PATH}/baileys_auth`;
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const { version } = await fetchLatestBaileysVersion();
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      dataPath: `${DATA_PATH}/.wwebjs_auth`,
-    }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-sync',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--no-default-browser-check',
-        '--safebrowsing-disable-auto-update',
-        '--disable-software-rasterizer',
-        '--disable-crash-reporter',
-        '--disable-breakpad',
-      ],
-    },
+  logger.info('Connecting to WhatsApp', { version, authPath });
+
+  sock = makeWASocket({
+    version,
+    logger: baileysLogger,
+    auth: state,
+    printQRInTerminal: false, // We'll handle QR ourselves
+    browser: ['TravelBuddy', 'Chrome', '120.0.0'],
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000,
+    markOnlineOnConnect: true,
+    syncFullHistory: false,
   });
 
-  // QR Code event
-  client.on('qr', (qr) => {
-    logger.info('QR Code received - scan with WhatsApp');
-    logger.info('QR_DATA:' + qr);
-    qrcode.generate(qr, { small: true }, (qrString) => {
+  // Bind store to socket events
+  store.bind(sock.ev);
+
+  // Handle connection updates
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    // QR Code received
+    if (qr) {
+      logger.info('QR Code received - scan with WhatsApp');
       console.log('\n========== SCAN THIS QR CODE ==========\n');
-      console.log(qrString);
+      qrcode.generate(qr, { small: true });
       console.log('\n========================================\n');
-    });
-  });
-
-  // Ready event
-  client.on('ready', () => {
-    isReady = true;
-    logger.info('WhatsApp client is ready');
-  });
-
-  // Authenticated event
-  client.on('authenticated', () => {
-    logger.info('WhatsApp client authenticated');
-  });
-
-  // Auth failure event
-  client.on('auth_failure', (msg) => {
-    logger.error('WhatsApp authentication failed', { message: msg });
-    isReady = false;
-  });
-
-  // Disconnected event
-  client.on('disconnected', (reason) => {
-    logger.warn('WhatsApp client disconnected', { reason });
-    isReady = false;
-    scheduleReconnect();
-  });
-
-  // Message event
-  client.on('message', handleMessage);
-
-  return client;
-}
-
-// =============================================================================
-// Reconnection Logic
-// =============================================================================
-
-let reconnectAttempts = 0;
-let reconnectTimeout = null;
-
-function scheduleReconnect() {
-  if (reconnectTimeout) return;
-
-  reconnectAttempts++;
-  const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts));
-
-  logger.info('Scheduling reconnect', { attempt: reconnectAttempts, delayMs: delay });
-
-  reconnectTimeout = setTimeout(async () => {
-    reconnectTimeout = null;
-    try {
-      logger.info('Attempting to reconnect WhatsApp client');
-      await client.initialize();
-      reconnectAttempts = 0;
-    } catch (error) {
-      logger.error('Reconnect failed', { error: error.message });
-      scheduleReconnect();
     }
-  }, delay);
+
+    // Connection opened
+    if (connection === 'open') {
+      isReady = true;
+      logger.info('WhatsApp connected successfully!');
+    }
+
+    // Connection closed
+    if (connection === 'close') {
+      isReady = false;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      logger.warn('WhatsApp connection closed', {
+        statusCode,
+        shouldReconnect,
+        error: lastDisconnect?.error?.message,
+      });
+
+      if (shouldReconnect) {
+        logger.info('Reconnecting in 5 seconds...');
+        setTimeout(connectToWhatsApp, 5000);
+      } else {
+        logger.error('Logged out from WhatsApp. Please delete auth folder and restart to re-scan QR.');
+      }
+    }
+  });
+
+  // Save credentials on update
+  sock.ev.on('creds.update', saveCreds);
+
+  // Handle incoming messages
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      await handleMessage(msg);
+    }
+  });
+
+  return sock;
 }
 
 // =============================================================================
@@ -378,28 +365,29 @@ function scheduleReconnect() {
 
 async function handleMessage(msg) {
   try {
+    // Ignore if no message content
+    if (!msg.message) return;
+
+    // Get sender JID
+    const jid = msg.key.remoteJid;
+
     // Ignore group messages
-    if (msg.from.includes('@g.us')) {
-      logger.debug('Ignoring group message', { from: msg.from });
+    if (jid.includes('@g.us')) {
+      logger.debug('Ignoring group message', { from: jid });
       return;
     }
 
     // Ignore status updates
-    if (msg.from === 'status@broadcast') {
-      return;
-    }
+    if (jid === 'status@broadcast') return;
 
     // Ignore messages from self
-    if (msg.fromMe) {
-      return;
-    }
+    if (msg.key.fromMe) return;
 
-    const messageId = msg.id?._serialized;
-    const userId = msg.from;
+    const messageId = msg.key.id;
+    const userId = jid;
 
     logger.info('Received message', {
       from: userId,
-      type: msg.type,
       messageId,
     });
 
@@ -415,13 +403,13 @@ async function handleMessage(msg) {
       const currentPromise = inflightRequests.get(userId);
       inflightRequests.set(
         userId,
-        currentPromise.then(() => processMessage(msg))
+        currentPromise.then(() => processMessage(msg, userId))
       );
       return;
     }
 
     // Process message with inflight tracking
-    const promise = processMessage(msg);
+    const promise = processMessage(msg, userId);
     inflightRequests.set(userId, promise);
 
     try {
@@ -437,9 +425,7 @@ async function handleMessage(msg) {
   }
 }
 
-async function processMessage(msg) {
-  const userId = msg.from;
-
+async function processMessage(msg, userId) {
   // Apply cooldown
   const lastReplyAt = userCooldowns.get(userId);
   if (lastReplyAt) {
@@ -480,19 +466,20 @@ async function processMessage(msg) {
 
   let reply;
 
+  // Extract message content
+  const messageContent = msg.message;
+
   // Handle different message types
-  switch (msg.type) {
-    case 'chat': // Text message
-      reply = await handleTextMessage(msg, userContext, isFirstEverMessage);
-      break;
-
-    case 'location':
-      reply = await handleLocationMessage(msg, userContext);
-      break;
-
-    default:
-      reply = handleUnsupportedMessage(msg);
-      break;
+  if (messageContent.conversation || messageContent.extendedTextMessage) {
+    // Text message
+    const text = messageContent.conversation || messageContent.extendedTextMessage?.text;
+    reply = await handleTextMessage(text, userContext, isFirstEverMessage);
+  } else if (messageContent.locationMessage) {
+    // Location message
+    reply = await handleLocationMessage(messageContent.locationMessage, userContext);
+  } else {
+    // Unsupported message type
+    reply = handleUnsupportedMessage(messageContent);
   }
 
   // Send reply
@@ -500,7 +487,7 @@ async function processMessage(msg) {
     // Add bot response to history
     addToHistory(userContext, 'assistant', reply);
 
-    await msg.reply(reply);
+    await sock.sendMessage(userId, { text: reply });
     userCooldowns.set(userId, Date.now());
     userMemory.set(userId, userContext);
 
@@ -520,8 +507,8 @@ async function processMessage(msg) {
   }
 }
 
-async function handleTextMessage(msg, userContext, isFirstEverMessage) {
-  const text = msg.body?.trim();
+async function handleTextMessage(text, userContext, isFirstEverMessage) {
+  text = text?.trim();
 
   if (!text) {
     return getFallbackMessage(!!userContext.locationData);
@@ -674,14 +661,13 @@ async function handleTextMessage(msg, userContext, isFirstEverMessage) {
   return getTravelReply({ text, userContext });
 }
 
-async function handleLocationMessage(msg, userContext) {
-  const location = msg.location;
-
-  if (!location || typeof location.latitude !== 'number') {
+async function handleLocationMessage(location, userContext) {
+  if (!location || typeof location.degreesLatitude !== 'number') {
     return "I received a location but couldn't read the coordinates. Could you try sharing again?";
   }
 
-  const { latitude, longitude } = location;
+  const latitude = location.degreesLatitude;
+  const longitude = location.degreesLongitude;
   const isUpdate = !!userContext.locationData;
 
   logger.info('Processing location', {
@@ -716,18 +702,16 @@ async function handleLocationMessage(msg, userContext) {
   });
 }
 
-function handleUnsupportedMessage(msg) {
-  const typeDescriptions = {
-    image: 'image',
-    video: 'video',
-    audio: 'voice message',
-    ptt: 'voice note',
-    document: 'document',
-    sticker: 'sticker',
-    contact: 'contact',
-  };
+function handleUnsupportedMessage(messageContent) {
+  const types = Object.keys(messageContent);
+  let typeName = 'that type of message';
 
-  const typeName = typeDescriptions[msg.type] || 'that type of message';
+  if (types.includes('imageMessage')) typeName = 'image';
+  else if (types.includes('videoMessage')) typeName = 'video';
+  else if (types.includes('audioMessage')) typeName = 'voice message';
+  else if (types.includes('documentMessage')) typeName = 'document';
+  else if (types.includes('stickerMessage')) typeName = 'sticker';
+  else if (types.includes('contactMessage')) typeName = 'contact';
 
   return `Thanks for the ${typeName}! 📱
 
@@ -780,16 +764,12 @@ app.get('/health', (req, res) => {
 async function shutdown(signal) {
   logger.info('Shutdown signal received', { signal });
 
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-  }
-
-  if (client) {
+  if (sock) {
     try {
-      await client.destroy();
-      logger.info('WhatsApp client destroyed');
+      await sock.logout();
+      logger.info('WhatsApp socket closed');
     } catch (error) {
-      logger.error('Error destroying client', { error: error.message });
+      logger.error('Error closing socket', { error: error.message });
     }
   }
 
@@ -823,7 +803,7 @@ process.on('unhandledRejection', (reason) => {
 // =============================================================================
 
 async function main() {
-  logger.info('Starting TravelBuddy WhatsApp Bot', {
+  logger.info('Starting TravelBuddy WhatsApp Bot (Baileys)', {
     nodeVersion: process.version,
     port: PORT,
     dataPath: DATA_PATH,
@@ -834,16 +814,15 @@ async function main() {
     logger.info('Health server listening', { port: PORT });
   });
 
-  client = createClient();
-
   try {
-    await client.initialize();
-    logger.info('WhatsApp client initialization started');
+    await connectToWhatsApp();
+    logger.info('WhatsApp connection initiated');
   } catch (error) {
-    logger.error('Failed to initialize WhatsApp client', {
+    logger.error('Failed to connect to WhatsApp', {
       error: error.message,
     });
-    scheduleReconnect();
+    // Retry connection
+    setTimeout(connectToWhatsApp, 5000);
   }
 }
 

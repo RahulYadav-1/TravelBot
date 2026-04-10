@@ -1,26 +1,18 @@
-# WhatsApp Travel Bot Dockerfile
-FROM node:20-bullseye-slim
+# WhatsApp Travel Bot Dockerfile (Baileys - lightweight)
+FROM node:20-alpine
 
 ENV NODE_ENV=production
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-
-# Install minimal Chromium dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
-    ca-certificates \
-    fonts-liberation \
-    libnss3 \
-    libxss1 \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Create persistent data directory
 RUN mkdir -p /app/data && chmod 777 /app/data
 
+# Install dependencies
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
+# Copy source code
 COPY src/ ./src/
 
 EXPOSE 3000
