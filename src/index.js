@@ -6,7 +6,8 @@
  */
 
 import 'dotenv/config';
-import makeWASocket, {
+import {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   makeInMemoryStore,
