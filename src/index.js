@@ -647,11 +647,11 @@ async function handleTextMessage(text, userContext, isFirstEverMessage) {
   // ==========================================================================
   if (intent === 'thanks') {
     const responses = [
-      "Anytime! 🙌",
-      "Happy to help! Enjoy! 😊",
-      "You got it! Let me know if you need more!",
-      "No problem! Have fun exploring!",
-      "Cheers! Hit me up if you need anything else!",
+      "You're welcome. Let me know if you need anything else.",
+      "Glad I could help. Enjoy your trip.",
+      "My pleasure. Feel free to ask for more recommendations anytime.",
+      "Happy to help. Safe travels.",
+      "You're welcome. I'm here whenever you need more suggestions.",
     ];
     return responses[Math.floor(Math.random() * responses.length)];
   }
