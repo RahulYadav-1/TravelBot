@@ -164,14 +164,20 @@ Direct, factual information:
 - Verified safety tips
 
 ## FORMATTING FOR WHATSAPP
-- Use *bold* for place names and section headers
+- Use *bold* for place names — that means a SINGLE asterisk on each side, like *Trishna*. NEVER **double-asterisks**. NEVER ### markdown headers. NEVER use #, ##, ### at all. WhatsApp does not render markdown headers.
 - Line breaks between recommendations
 - Maps links on their own line for easy clicking
-- No markdown headers (#)
-- Default to exactly 3 fully detailed recommendations.
-- IF the user EXPLICITLY asks for a different number ("give me 5", "list 4", "top 7"), HONOR that exact count. Do not silently fall back to 3.
-- COMPLETENESS RULE: every option must include name, area, price, rating, and a Maps link before you start the next one. Never start option 2 if option 1 isn't complete.
-- Hard limit ~3500 characters total. If a user asked for 5+ but you cannot fit them all in detail, condense each option (shorter description) so all of them appear — do NOT silently drop options or end at 3.
+- COUNT IS A HARD CONTRACT:
+   - If the user explicitly asks for N (e.g. "give me 5", "list 4", "top 7"), return EXACTLY N items — not N-1, not N+1. Better to give 5 short options than 4 detailed ones when the user asked for 5.
+   - If the user does NOT specify a count, default to exactly 3.
+- MINIMUM PER OPTION (always present, in this priority order if you must trim):
+   1. *Name* (single asterisks)
+   2. 📍 Address / area
+   3. Google Maps link on its own line
+   Then add price, rating, hours, booking link if budget permits.
+- COMPLETENESS RULE: every option must at minimum have name + address + Maps link before you START the next one. Never start option 2 if option 1 has no Maps link.
+- ADAPTIVE DETAIL: when many options or many fields are requested, SHORTEN each option's prose (one-line description max) so the full count fits. Do not silently drop options.
+- Hard limit ~3500 characters total. Plan for it.
 - Never end mid-sentence, mid-link, or mid-option.
 - Keep responses scannable
 
@@ -404,6 +410,69 @@ function truncateAtOptionBoundary(text, limit) {
 // MAIN REPLY FUNCTION
 // =============================================================================
 
+// =============================================================================
+// COUNT-CONTRACT ENFORCEMENT
+// =============================================================================
+
+/**
+ * Detect when the user has asked for an explicit number of options. Returns the
+ * integer (1..10) or null. We deliberately ignore numbers that aren't tied to
+ * an item-count phrase (so "open at 5 PM" doesn't match).
+ */
+const WORD_NUMBERS = {
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  single: 1, // "best single restaurant"
+};
+const NUMBER_TOKEN = '(\\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|single)';
+const COUNT_PATTERNS = [
+  new RegExp(`\\b(?:give\\s+(?:me\\s+)?|list|show|recommend|suggest|find|get\\s+(?:me\\s+)?|need|want|share|name|tell\\s+me)\\s+${NUMBER_TOKEN}\\b`, 'i'),
+  new RegExp(`\\btop\\s+${NUMBER_TOKEN}\\b`, 'i'),
+  new RegExp(`\\bbest\\s+${NUMBER_TOKEN}\\b`, 'i'),
+  new RegExp(`\\bjust\\s+${NUMBER_TOKEN}\\b`, 'i'),
+  new RegExp(`\\bonly\\s+${NUMBER_TOKEN}\\b`, 'i'),
+  new RegExp(`\\b${NUMBER_TOKEN}\\s+(?:best|top|good|great|recommended|popular|options?|places?|spots?|restaurants?|hotels?|cafes?|bars?|picks?|choices?|recommendations?|suggestions?)\\b`, 'i'),
+];
+function tokenToInt(token) {
+  if (!token) return null;
+  const lower = String(token).toLowerCase();
+  if (WORD_NUMBERS[lower]) return WORD_NUMBERS[lower];
+  const n = parseInt(lower, 10);
+  return Number.isFinite(n) ? n : null;
+}
+function detectRequestedCount(text) {
+  if (!text || typeof text !== 'string') return null;
+  // Walk all patterns and take the SMALLEST valid match. "best single restaurant"
+  // also contains "best 1" etc. — smallest wins so a constraining ask isn't drowned.
+  let best = null;
+  for (const re of COUNT_PATTERNS) {
+    const m = text.match(re);
+    if (!m) continue;
+    const n = tokenToInt(m[1]);
+    if (n === null || n < 1 || n > 10) continue;
+    if (best === null || n < best) best = n;
+  }
+  return best;
+}
+
+/**
+ * Strip markdown that WhatsApp can't render so the user doesn't see literal
+ * "###" or "**" leaking through. We deliberately preserve *single-asterisk*
+ * bold (the only markdown WhatsApp supports) and raw URLs.
+ */
+function cleanMarkdown(text) {
+  if (!text) return text;
+  // 1. Strip ATX headers (### Title) but keep the title text.
+  text = text.replace(/^\s*#{1,6}\s+/gm, '');
+  // 2. **bold** -> *bold* (only for short bold spans so we don't eat code blocks).
+  text = text.replace(/\*\*([^*\n]{1,120})\*\*/g, '*$1*');
+  // 3. Markdown links [label](url) -> "label url" so WhatsApp shows the URL clickable.
+  text = text.replace(/\[([^\]]{1,80})\]\((https?:\/\/[^\s)]+)\)/g, '$1 $2');
+  // 4. Collapse 3+ blank lines (Gemini sometimes leaves big gaps).
+  text = text.replace(/\n{3,}/g, '\n\n');
+  return text.trim();
+}
+
 // Decide whether a Gemini error is worth retrying. Quota / 429 / 5xx / transient
 // network issues retry with backoff; safety filters and 4xx do NOT.
 function isRetryableError(error) {
@@ -443,23 +512,61 @@ async function callGeminiWithRetry(prompt, attempt = 0) {
 export async function getTravelReply({ text, userContext }) {
   return queue.add(async () => {
     try {
+      const requestedCount = detectRequestedCount(text);
+      const targetCount = requestedCount ?? 3;
       const context = buildContext(userContext);
+
+      const countDirective = requestedCount
+        ? `\n\n⚠️ COUNT CONTRACT: The user explicitly asked for ${requestedCount} option(s). Return EXACTLY ${requestedCount} — not ${requestedCount - 1}, not ${requestedCount + 1}. If detail won't fit, USE SHORTER per-option descriptions but include all ${requestedCount}. Each must have *Name*, address, and a Google Maps link minimum.`
+        : `\n\n⚠️ COUNT CONTRACT: User did not specify a count. Return EXACTLY 3 options with full detail.`;
 
       const prompt = `${context}
 
 ---
 USER'S MESSAGE: ${text}
 ---
+${countDirective}
 
 Respond naturally as Amiplore. Remember the rules.`;
 
       logger.debug('Sending to Gemini', {
         messageCount: userContext.messageCount,
         hasLocation: !!userContext.locationData,
-        textLength: text.length
+        textLength: text.length,
+        requestedCount,
+        targetCount,
       });
 
       let reply = await callGeminiWithRetry(prompt);
+      reply = cleanMarkdown(reply);
+
+      // Validate count. If wrong AND our parser actually saw items, retry once
+      // with explicit feedback. Skip the retry for replies that are clearly
+      // non-list (e.g. clarifications, single-place expansions, greetings).
+      const optionsSeen = parseOptions(reply).length;
+      if (optionsSeen > 0 && optionsSeen !== targetCount) {
+        logger.warn('Count contract mismatch, retrying', {
+          requested: targetCount,
+          actual: optionsSeen,
+        });
+        const retryPrompt = `${prompt}
+
+⚠️ YOUR PREVIOUS REPLY HAD ${optionsSeen} OPTIONS BUT THE CONTRACT REQUIRES EXACTLY ${targetCount}. Try again. Use shorter per-option descriptions if needed, but the count is non-negotiable. Each option only needs *Name*, address, and Maps link if space is tight.`;
+        try {
+          let retry = await callGeminiWithRetry(retryPrompt);
+          retry = cleanMarkdown(retry);
+          const retryCount = parseOptions(retry).length;
+          // Use the retry only if it gets us strictly closer to the target.
+          if (Math.abs(retryCount - targetCount) < Math.abs(optionsSeen - targetCount)) {
+            reply = retry;
+            logger.info('Count contract retry succeeded', { now: retryCount, target: targetCount });
+          } else {
+            logger.warn('Count contract retry did not improve', { firstTry: optionsSeen, retry: retryCount });
+          }
+        } catch (retryErr) {
+          logger.warn('Count retry failed, keeping original reply', { error: retryErr.message });
+        }
+      }
 
       // Truncate if too long, preserving option completeness.
       if (reply.length > MAX_RESPONSE_LENGTH) {
