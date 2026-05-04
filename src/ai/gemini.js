@@ -1,17 +1,19 @@
 /**
- * Gemini AI Integration for TravelBuddy
+ * Gemini AI Integration for Amiplore
  * Enhanced with conversation memory, weather, and intelligent responses
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import PQueue from 'p-queue';
 import logger from '../util/logger.js';
+import { resolveTimezone, getTimezoneForCity } from '../util/cityTimezone.js';
 
 // Configuration
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const AI_CONCURRENCY = parseInt(process.env.AI_CONCURRENCY, 10) || 3;
-const MAX_RESPONSE_LENGTH = 1200;
+// WhatsApp message limit is 4096 chars; leave headroom for safety + the rare unicode width quirk.
+const MAX_RESPONSE_LENGTH = 3800;
 
 if (!GEMINI_API_KEY) {
   logger.error('GEMINI_API_KEY is required');
@@ -32,7 +34,7 @@ const queue = new PQueue({ concurrency: AI_CONCURRENCY });
 // MASTER SYSTEM PROMPT - The brain of the bot
 // =============================================================================
 
-const SYSTEM_PROMPT = `You are TravelBuddy - a professional, knowledgeable travel assistant on WhatsApp. You help travelers discover real places with verified information.
+const SYSTEM_PROMPT = `You are Amiplore - a professional, knowledgeable travel assistant on WhatsApp. You help travelers discover real places with verified information.
 
 ## YOUR PERSONALITY
 - Professional yet approachable - like a well-informed concierge
@@ -98,6 +100,7 @@ For each place recommendation, use this format:
 - "closer" → 3 nearby options with distances
 - "different" → 3 options from different category
 - "again" → repeat last specific recommendation
+- When the user references a previous option ("tell me more about option 2", "the third one", "expand on #1", or just a bare number after a numbered list), look up that exact option in your prior reply (it will be visible in RECENT CONVERSATION) and give a deeper, specific response about THAT place. Never invent a different place. If you cannot identify which option they meant, ask them to clarify by name.
 
 ## CONTEXT-AWARE BEHAVIORS
 
@@ -108,6 +111,7 @@ For each place recommendation, use this format:
 - 6-9 PM: Dinner restaurants with reservations if needed
 - 9 PM-12 AM: Late-night dining, safe areas only
 - 12-6 AM: 24/7 spots only, prioritize safety
+- Always use the user's local time zone when location is known.
 
 ### Weather Awareness
 - Hot (>35°C): AC restaurants, indoor attractions, malls
@@ -163,7 +167,10 @@ Direct, factual information:
 - Line breaks between recommendations
 - Maps links on their own line for easy clicking
 - No markdown headers (#)
-- Maximum 3-4 recommendations per response
+- Give exactly 3 fully detailed recommendations unless the user explicitly asks for more
+- COMPLETENESS RULE: every option must include name, area, price, rating, and a Maps link before you start the next one. Never start option 2 if option 1 isn't complete. Never start option 3 if option 2 isn't complete.
+- Hard limit ~3500 characters total. If you cannot fit 3 full options, give 2 complete options instead of 3 truncated ones. Better fewer-and-complete than many-and-cut.
+- Never end mid-sentence, mid-link, or mid-option.
 - Keep responses scannable
 
 ## EXAMPLES
@@ -210,10 +217,44 @@ Remember: Be specific, be professional, always include real names and Google Map
 // CONTEXT BUILDER
 // =============================================================================
 
+function resolveUserTimezone(userContext) {
+  // Priority: weather (most precise, from GPS) > locationData lookup > lastCity lookup.
+  if (userContext.weather?.timezone) return userContext.weather.timezone;
+  if (userContext.locationData) {
+    const tz = resolveTimezone(userContext.locationData);
+    if (tz) return tz;
+  }
+  if (userContext.lastCity) {
+    const tz = getTimezoneForCity(userContext.lastCity);
+    if (tz) return tz;
+  }
+  return null;
+}
+
 function buildContext(userContext) {
   const parts = [];
-  const now = new Date();
-  const hour = now.getHours();
+  const timezone = resolveUserTimezone(userContext);
+  let localTime = null;
+  let localDate = null;
+  let hour;
+  let timeZoneSource = timezone ? 'derived' : 'server';
+
+  const formatInTz = (opts) => new Intl.DateTimeFormat('en-US', {
+    ...opts,
+    ...(timezone ? { timeZone: timezone } : {}),
+  }).format(new Date());
+
+  try {
+    localTime = formatInTz({ hour: '2-digit', minute: '2-digit', hour12: false });
+    localDate = formatInTz({ weekday: 'short', month: 'short', day: 'numeric' });
+    hour = parseInt(formatInTz({ hour: 'numeric', hour12: false }), 10);
+  } catch (error) {
+    logger.warn('Timezone formatting failed, falling back to server time', { timezone, error: error.message });
+    timeZoneSource = 'server-fallback';
+    localTime = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+    localDate = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date());
+    hour = new Date().getHours();
+  }
 
   // Time context
   let timeOfDay;
@@ -224,13 +265,20 @@ function buildContext(userContext) {
   else if (hour >= 21 || hour < 1) timeOfDay = 'Night';
   else timeOfDay = 'Late night (most places closed)';
 
-  parts.push(`🕐 TIME: ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} - ${timeOfDay}`);
+  const tzLabel = timezone ? ` (${timezone})` : ' (server time — user has not shared location)';
+  parts.push(`🕐 LOCAL TIME: ${localDate} ${localTime}${tzLabel} - ${timeOfDay}`);
+  if (timeZoneSource === 'server' || timeZoneSource === 'server-fallback') {
+    parts.push(`⚠️ Time may be inaccurate. If you reference the time of day, hedge appropriately.`);
+  }
 
-  // Location context
+  // Location context — distinguish precise GPS share from a city the user mentioned.
   if (userContext.locationData?.fullAddress) {
-    parts.push(`📍 LOCATION: ${userContext.locationData.fullAddress}`);
+    parts.push(`📍 LOCATION (GPS-shared): ${userContext.locationData.fullAddress}`);
+    if (userContext.lastCity && userContext.lastCity.toLowerCase() !== (userContext.locationData.city || '').toLowerCase()) {
+      parts.push(`🌐 ALSO ASKING ABOUT: ${userContext.lastCity}`);
+    }
   } else if (userContext.lastCity) {
-    parts.push(`📍 CITY: ${userContext.lastCity}`);
+    parts.push(`📍 CITY (mentioned, not GPS): ${userContext.lastCity}`);
   } else {
     parts.push(`📍 LOCATION: Not shared yet`);
   }
@@ -256,12 +304,31 @@ function buildContext(userContext) {
     parts.push(`⚠️ ALREADY GREETED - Do NOT say hello/welcome again`);
   }
 
-  // Conversation history
+  // Conversation history. Assistant replies are kept in full so the model can
+  // accurately reference its previous recommendations on follow-up turns.
+  // User messages are capped because long pastes from users are usually noisy.
   if (userContext.conversationHistory?.length > 0) {
     parts.push(`\n📝 RECENT CONVERSATION:`);
-    userContext.conversationHistory.slice(-6).forEach(msg => {
+    const USER_CAP = 500;
+    const ASSISTANT_CAP = 3500;
+    // Always include the most recent assistant reply IN FULL so ordinal references
+    // ("option 3", "the second one") can be resolved even if it falls outside the window.
+    const history = userContext.conversationHistory;
+    const recent = history.slice(-10);
+    // Find latest assistant message anywhere in history; if it's not already in recent, prepend.
+    let latestAssistantIdx = -1;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].role === 'assistant') { latestAssistantIdx = i; break; }
+    }
+    const latestAssistantMsg = latestAssistantIdx >= 0 ? history[latestAssistantIdx] : null;
+    const latestInWindow = latestAssistantMsg && recent.includes(latestAssistantMsg);
+    if (latestAssistantMsg && !latestInWindow) {
+      parts.push(`You (earlier — kept for option references): ${latestAssistantMsg.text}`);
+    }
+    recent.forEach(msg => {
       const role = msg.role === 'user' ? 'User' : 'You';
-      const text = msg.text.length > 100 ? msg.text.substring(0, 100) + '...' : msg.text;
+      const cap = msg.role === 'user' ? USER_CAP : ASSISTANT_CAP;
+      const text = msg.text.length > cap ? msg.text.substring(0, cap) + '...' : msg.text;
       parts.push(`${role}: ${text}`);
     });
   }
@@ -279,9 +346,86 @@ function buildContext(userContext) {
   return parts.join('\n');
 }
 
+/**
+ * Truncate a reply without cutting mid-option. Tries (in order):
+ *   1. Find the last complete option boundary (numbered marker, *bold* title line, or
+ *      double newline) at or before the limit.
+ *   2. Fall back to last full sentence.
+ *   3. Last resort: hard cut + ellipsis.
+ */
+function truncateAtOptionBoundary(text, limit) {
+  if (text.length <= limit) return text;
+
+  const window = text.substring(0, limit);
+
+  // 1. Look for option-start markers we'd want to truncate JUST BEFORE.
+  const markers = [];
+  const numberedRe = /\n\s*\d{1,2}[\.\)\-:]\s+/g;
+  let m;
+  while ((m = numberedRe.exec(window)) !== null) markers.push(m.index);
+  const boldRe = /\n\s*\*[^\*\n]{2,80}\*/g;
+  while ((m = boldRe.exec(window)) !== null) markers.push(m.index);
+
+  // The last marker found is the start of an option that is likely INCOMPLETE
+  // (since we hit the limit). Cut just before that marker so the prior option
+  // remains whole. Require at least 3 markers so we don't accidentally drop
+  // option #3 when the model produced exactly 3 options (the common case).
+  if (markers.length >= 3) {
+    const cutAt = markers[markers.length - 1];
+    if (cutAt > limit * 0.4) {
+      return text.substring(0, cutAt).trimEnd();
+    }
+  }
+
+  // 2. Sentence boundary
+  const lastSentence = window.lastIndexOf('. ');
+  if (lastSentence > limit * 0.7) {
+    return text.substring(0, lastSentence + 1);
+  }
+
+  // 3. Hard cut
+  return window.trimEnd() + '...';
+}
+
 // =============================================================================
 // MAIN REPLY FUNCTION
 // =============================================================================
+
+// Decide whether a Gemini error is worth retrying. Quota / 429 / 5xx / transient
+// network issues retry with backoff; safety filters and 4xx do NOT.
+function isRetryableError(error) {
+  const msg = (error?.message || '').toLowerCase();
+  if (msg.includes('safety')) return false;
+  if (msg.includes('invalid') || msg.includes('400')) return false;
+  if (msg.includes('quota') || msg.includes('429') || msg.includes('rate')) return true;
+  if (msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('504')) return true;
+  if (msg.includes('timeout') || msg.includes('econnreset') || msg.includes('etimedout') || msg.includes('socket')) return true;
+  if (msg.includes('fetch failed') || msg.includes('network')) return true;
+  return false;
+}
+
+const RETRY_DELAYS_MS = [600, 1500, 3500];
+
+async function callGeminiWithRetry(prompt, attempt = 0) {
+  try {
+    const chat = model.startChat({
+      history: [
+        { role: 'user', parts: [{ text: 'You are Amiplore. Here are your instructions:' }] },
+        { role: 'model', parts: [{ text: SYSTEM_PROMPT }] },
+      ],
+    });
+    const result = await chat.sendMessage(prompt);
+    return result.response.text().trim();
+  } catch (error) {
+    if (attempt < RETRY_DELAYS_MS.length && isRetryableError(error)) {
+      const delay = RETRY_DELAYS_MS[attempt] + Math.floor(Math.random() * 250);
+      logger.warn('Gemini call failed, retrying', { attempt: attempt + 1, delayMs: delay, error: error.message });
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return callGeminiWithRetry(prompt, attempt + 1);
+    }
+    throw error;
+  }
+}
 
 export async function getTravelReply({ text, userContext }) {
   return queue.add(async () => {
@@ -294,7 +438,7 @@ export async function getTravelReply({ text, userContext }) {
 USER'S MESSAGE: ${text}
 ---
 
-Respond naturally as TravelBuddy. Remember the rules.`;
+Respond naturally as Amiplore. Remember the rules.`;
 
       logger.debug('Sending to Gemini', {
         messageCount: userContext.messageCount,
@@ -302,41 +446,26 @@ Respond naturally as TravelBuddy. Remember the rules.`;
         textLength: text.length
       });
 
-      const chat = model.startChat({
-        history: [
-          { role: 'user', parts: [{ text: 'You are TravelBuddy. Here are your instructions:' }] },
-          { role: 'model', parts: [{ text: SYSTEM_PROMPT }] },
-        ],
-      });
+      let reply = await callGeminiWithRetry(prompt);
 
-      const result = await chat.sendMessage(prompt);
-      let reply = result.response.text().trim();
-
-      // Truncate if too long
+      // Truncate if too long, preserving option completeness.
       if (reply.length > MAX_RESPONSE_LENGTH) {
-        // Try to cut at a sentence
-        const truncated = reply.substring(0, MAX_RESPONSE_LENGTH);
-        const lastSentence = truncated.lastIndexOf('. ');
-        if (lastSentence > MAX_RESPONSE_LENGTH * 0.7) {
-          reply = truncated.substring(0, lastSentence + 1);
-        } else {
-          reply = truncated + '...';
-        }
+        reply = truncateAtOptionBoundary(reply, MAX_RESPONSE_LENGTH);
       }
 
       logger.debug('Gemini response', { replyLength: reply.length });
       return reply;
 
     } catch (error) {
-      logger.error('Gemini API error', { error: error.message });
+      logger.error('Gemini API error after retries', { error: error.message });
 
-      if (error.message?.includes('quota')) {
-        return "I'm getting a lot of questions rn! Try again in a sec 🙏";
+      if (error.message?.toLowerCase().includes('quota')) {
+        return "I am handling a high volume of requests right now. Please try again in a minute.";
       }
-      if (error.message?.includes('safety')) {
-        return "I can only help with travel stuff. What do you want to explore?";
+      if (error.message?.toLowerCase().includes('safety')) {
+        return "I can only help with travel-related questions. What would you like to explore?";
       }
-      return "Hmm something went wrong. Try asking differently?";
+      return "I had trouble reaching my data source. Please try again in a moment.";
     }
   });
 }
@@ -368,7 +497,7 @@ export async function handleLocationReceived({ locationData, userContext, isUpda
  * Welcome message for first-time users
  */
 export function getWelcomeMessage({ hasLocation, locationData }) {
-  let msg = `Welcome to TravelBuddy 📍
+  let msg = `Welcome to Amiplore 📍
 
 Your personal travel assistant for verified recommendations on:
 
@@ -410,7 +539,7 @@ Current location: *${locationData.fullAddress}*
 
 What are you looking for today?`;
   }
-  return `Welcome back to TravelBuddy.
+  return `Welcome back to Amiplore.
 
 Share your location or ask about any destination to get started.`;
 }
@@ -419,7 +548,7 @@ Share your location or ask about any destination to get started.`;
  * Help menu
  */
 export function getHelpMenu(locationDisplay) {
-  let menu = `*TravelBuddy - Quick Guide*
+  let menu = `*Amiplore - Quick Guide*
 
 *Common Requests:*
 • "Best restaurants nearby"

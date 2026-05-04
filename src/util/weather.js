@@ -60,6 +60,15 @@ export async function getWeather(latitude, longitude) {
  */
 function parseWeatherResponse(data) {
   const current = data.current;
+  const timezone = data.timezone || null;
+  const localTime = timezone
+    ? new Intl.DateTimeFormat('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: timezone,
+      }).format(new Date())
+    : null;
 
   return {
     temperature: Math.round(current.temperature_2m),
@@ -68,6 +77,8 @@ function parseWeatherResponse(data) {
     condition: getWeatherCondition(current.weather_code),
     icon: getWeatherIcon(current.weather_code),
     isGoodForOutdoor: isGoodOutdoorWeather(current),
+    timezone,
+    localTime,
   };
 }
 

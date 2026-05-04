@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp-travel-bot",
+  "name": "amiplore",
   "version": "1.0.0",
   "description": "WhatsApp Travel Assistant Bot using Gemini AI",
   "main": "src/index.js",

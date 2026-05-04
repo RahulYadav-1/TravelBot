@@ -5,7 +5,7 @@
 import logger from './logger.js';
 
 const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
-const USER_AGENT = 'TravelBot/1.0';
+const USER_AGENT = 'Amiplore/1.0';
 
 // Cache to avoid repeated API calls for same coordinates
 const geocodeCache = new Map();

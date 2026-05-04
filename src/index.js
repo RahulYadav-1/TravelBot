@@ -1,5 +1,5 @@
 /**
- * WhatsApp Travel Assistant Bot - TravelBuddy
+ * WhatsApp Travel Assistant Bot - Amiplore
  * Using Baileys for reliable WhatsApp connection
  * Enhanced with smart greetings, location awareness, weather, conversation memory,
  * quick actions, save/bookmark, emergency detection, and intelligent responses
@@ -27,10 +27,14 @@ import {
   getFallbackMessage,
   getQueueStats,
 } from './ai/gemini.js';
+import path from 'node:path';
 import { TTLMap } from './util/ttlMap.js';
+import { PersistentStore } from './util/storage.js';
 import { deduplicator } from './util/dedupe.js';
 import { reverseGeocode, getLocationDisplay } from './util/geocoding.js';
 import { getWeather } from './util/weather.js';
+import { extractCity } from './util/cityExtractor.js';
+import { parseOptions, extractOrdinalReference, findReferencedOption } from './util/optionParser.js';
 import logger from './util/logger.js';
 
 // =============================================================================
@@ -40,8 +44,11 @@ import logger from './util/logger.js';
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DATA_PATH = process.env.DATA_PATH || '/app/data';
 const USER_COOLDOWN_MS = parseInt(process.env.USER_COOLDOWN_MS, 10) || 2000;
-const USER_MEMORY_TTL = 30 * 60 * 1000; // 30 minutes session
-const MAX_CONVERSATION_HISTORY = 10; // Store last 10 messages
+// 8-hour session window. Long enough that a traveler returning from sightseeing
+// still finds their context (location, preferences, history) intact without
+// re-sharing. Persistent registry survives beyond this anyway.
+const USER_MEMORY_TTL = 8 * 60 * 60 * 1000;
+const MAX_CONVERSATION_HISTORY = 14; // Store last 14 messages — keeps option-3 recall window wider
 
 // Baileys logger (silent to reduce noise)
 const baileysLogger = pino({ level: 'silent' });
@@ -54,11 +61,20 @@ let isReady = false;
 let sock = null;
 const startTime = Date.now();
 
-// User memory: stores session data including conversation history
+// User memory: ephemeral session data (30-min TTL). On miss, hydrated from
+// the persistent registry. Holds session-only fields like hasGreeted,
+// sessionStartedAt, and the live messageCount.
 const userMemory = new TTLMap(USER_MEMORY_TTL);
 
-// Permanent user registry (to detect returning users) - longer TTL
-const userRegistry = new TTLMap(7 * 24 * 60 * 60 * 1000); // 7 days
+// Persistent user registry. Survives restarts. Holds long-lived fields:
+// savedPlaces, preferences, travelStyle, lastCity, locationData, weather,
+// conversationHistory (last N), lastTopic, lastIntent, firstSeenAt, lastSeenAt.
+// Default TTL Infinity (no automatic expiry); we manage staleness via lastSeenAt.
+const userRegistry = new PersistentStore({
+  filePath: path.join(DATA_PATH, 'users.json'),
+  defaultTTL: Infinity,
+  flushDebounceMs: 500,
+});
 
 // User cooldowns: stores lastReplyAt timestamp
 const userCooldowns = new TTLMap(USER_COOLDOWN_MS * 2);
@@ -163,24 +179,44 @@ function detectTravelStyle(text) {
 }
 
 /**
- * Detect city names in text
+ * Detect city names in text. Uses cityExtractor (known-city set + preposition-led
+ * fallback) so cities outside the legacy regex list are still captured.
  */
-const CITY_PATTERNS = [
-  /\b(paris|london|tokyo|new york|rome|barcelona|amsterdam|berlin|dubai|singapore)\b/i,
-  /\b(bangkok|bali|sydney|melbourne|toronto|vancouver|los angeles|san francisco)\b/i,
-  /\b(istanbul|cairo|mumbai|delhi|hong kong|seoul|taipei|kuala lumpur)\b/i,
-  /\b(lisbon|prague|vienna|budapest|athens|stockholm|oslo|copenhagen)\b/i,
-  /\b(miami|chicago|boston|seattle|denver|austin|nashville|new orleans)\b/i,
-  /\b(rio|buenos aires|lima|bogota|mexico city|havana|cartagena)\b/i,
-  /\b(marrakech|cape town|johannesburg|nairobi|zanzibar|mauritius)\b/i,
-  /\b(goa|jaipur|agra|varanasi|kolkata|chennai|bangalore|hyderabad|pune|ahmedabad|lucknow|chandigarh|shimla|manali|rishikesh|udaipur|jodhpur)\b/i,
-];
-
 function detectCity(text) {
-  for (const pattern of CITY_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) return match[1];
+  return extractCity(text);
+}
+
+/**
+ * Detect when a user message is referencing a specific option from the bot's
+ * last reply. Returns the matched option body (so we can either show it
+ * directly or hand it to Gemini for a deeper response), or null.
+ */
+function handleOrdinalReference(text, userContext) {
+  const lastResponse = getLastBotResponse(userContext);
+  const lastResponseHadList = !!(lastResponse && parseOptions(lastResponse).length > 0);
+
+  const ordinal = extractOrdinalReference(text, { lastResponseHadList });
+  if (!ordinal) return null;
+
+  const details = lastResponse ? findReferencedOption(lastResponse, text) : null;
+  if (details) {
+    // Hand this to Gemini so it can EXPAND on the option (more depth, current
+    // info via search) rather than just re-quoting. The previous code just
+    // re-quoted, which is what made continuity feel "weak".
+    return {
+      kind: 'expand',
+      ordinal,
+      optionText: details,
+    };
   }
+
+  if (lastResponse) {
+    return {
+      kind: 'clarify',
+      ordinal,
+    };
+  }
+
   return null;
 }
 
@@ -295,7 +331,7 @@ async function connectToWhatsApp() {
     logger: baileysLogger,
     auth: state,
     printQRInTerminal: false, // We'll handle QR ourselves
-    browser: ['TravelBuddy', 'Chrome', '120.0.0'],
+    browser: ['Amiplore', 'Chrome', '120.0.0'],
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 30000,
@@ -398,26 +434,29 @@ async function handleMessage(msg) {
       return;
     }
 
-    // Check if there's already an inflight request for this user
-    if (inflightRequests.has(userId)) {
-      logger.debug('User has inflight request, queuing', { userId });
-      const currentPromise = inflightRequests.get(userId);
-      inflightRequests.set(
-        userId,
-        currentPromise.then(() => processMessage(msg, userId))
-      );
-      return;
-    }
-
-    // Process message with inflight tracking
-    const promise = processMessage(msg, userId);
-    inflightRequests.set(userId, promise);
-
-    try {
-      await promise;
-    } finally {
-      inflightRequests.delete(userId);
-    }
+    // Per-user serial queue. Each new message chains after the prior one's
+    // settlement so we never produce two replies in parallel for the same user.
+    // We always update inflightRequests with a "tail" promise that resolves
+    // when the chain is idle, and we delete the entry only when this exact
+    // tail is still the current one — so concurrent inserts can't orphan it.
+    const prior = inflightRequests.get(userId) || Promise.resolve();
+    const tail = prior
+      .catch(() => { /* prior errors already logged below */ })
+      .then(() => processMessage(msg, userId))
+      .catch((error) => {
+        logger.error('processMessage failed', {
+          userId,
+          error: error.message,
+          stack: error.stack,
+        });
+      });
+    inflightRequests.set(userId, tail);
+    tail.finally(() => {
+      // Only clear if we're still the current tail (no newer message chained on top).
+      if (inflightRequests.get(userId) === tail) {
+        inflightRequests.delete(userId);
+      }
+    });
   } catch (error) {
     logger.error('Error handling message', {
       error: error.message,
@@ -443,7 +482,9 @@ async function processMessage(msg, userId) {
   const isFirstEverMessage = !userRegistry.has(userId);
   const registryData = userRegistry.get(userId) || {};
 
-  // Initialize new session if needed
+  // Initialize new session if needed. Hydrates from the persistent registry
+  // so a returning user (after process restart, deploy, or session expiry)
+  // sees their saved places, preferences, location, and recent conversation.
   if (!userContext.sessionStartedAt) {
     userContext = {
       ...userContext,
@@ -451,13 +492,24 @@ async function processMessage(msg, userId) {
       isNewUser: isFirstEverMessage,
       messageCount: 0,
       hasGreeted: false,
-      conversationHistory: [],
+      conversationHistory: userContext.conversationHistory || registryData.conversationHistory || [],
       savedPlaces: registryData.savedPlaces || [],
+      preferences: { ...userContext.preferences, ...registryData.preferences },
+      travelStyle: userContext.travelStyle || registryData.travelStyle,
+      lastCity: userContext.lastCity || registryData.lastCity,
+      locationData: userContext.locationData || registryData.locationData,
+      weather: userContext.weather || registryData.weather,
+      lastTopic: userContext.lastTopic || registryData.lastTopic,
+      lastIntent: userContext.lastIntent || registryData.lastIntent,
     };
 
-    // Register user
+    // Register user (seed with full context shape so subsequent reads are stable)
     if (isFirstEverMessage) {
-      userRegistry.set(userId, { firstSeenAt: Date.now(), savedPlaces: [] });
+      userRegistry.set(userId, {
+        firstSeenAt: Date.now(),
+        savedPlaces: [],
+        preferences: {},
+      });
       logger.info('New user registered', { userId });
     }
   }
@@ -477,7 +529,7 @@ async function processMessage(msg, userId) {
     reply = await handleTextMessage(text, userContext, isFirstEverMessage);
   } else if (messageContent.locationMessage) {
     // Location message
-    reply = await handleLocationMessage(messageContent.locationMessage, userContext);
+    reply = await handleLocationMessage(messageContent.locationMessage, userContext, userId);
   } else {
     // Unsupported message type
     reply = handleUnsupportedMessage(messageContent);
@@ -488,23 +540,24 @@ async function processMessage(msg, userId) {
     // Add bot response to history
     addToHistory(userContext, 'assistant', reply);
 
-    await sock.sendMessage(userId, { text: reply });
+    // Persist context BEFORE sending. If WhatsApp send fails (network, disconnect),
+    // we still want the location/preferences/history captured this turn to survive.
+    persistUserContext(userId, userContext);
     userCooldowns.set(userId, Date.now());
-    userMemory.set(userId, userContext);
 
-    // Update registry with saved places
-    const currentRegistry = userRegistry.get(userId) || {};
-    userRegistry.set(userId, {
-      ...currentRegistry,
-      savedPlaces: userContext.savedPlaces,
-      lastSeenAt: Date.now(),
-    });
+    await sock.sendMessage(userId, { text: reply });
 
     logger.info('Sent reply', {
       to: userId,
       replyLength: reply.length,
       messageCount: userContext.messageCount,
+      hasLocation: !!userContext.locationData,
+      lastCity: userContext.lastCity || null,
     });
+  } else {
+    // No reply but the user message still updated context (preferences, lastCity, etc).
+    // Persist so we don't drop those side-effects and so lastSeenAt stays fresh.
+    persistUserContext(userId, userContext);
   }
 }
 
@@ -524,6 +577,20 @@ async function handleTextMessage(text, userContext, isFirstEverMessage) {
   const detectedCity = detectCity(text);
   const detectedPrefs = detectPreferences(text);
   const travelStyle = detectTravelStyle(text);
+
+  // Handle explicit ordinal follow-up requests like "option 3", "third choice",
+  // or just "3" after a numbered reply. We hand the matched option to Gemini so
+  // it can EXPAND with more detail, rather than just re-quoting the prior text.
+  const ordinalResponse = handleOrdinalReference(text, userContext);
+  if (ordinalResponse && !intent && !quickAction) {
+    if (ordinalResponse.kind === 'expand') {
+      const expandPrompt = `[USER WANTS MORE DETAIL ON OPTION ${ordinalResponse.ordinal} FROM YOUR LAST REPLY] - That option was: "${ordinalResponse.optionText}". User just said: "${text}". Give a deeper, specific response about THAT exact place: more on what makes it worth visiting, ideal time to go, what to order/see, getting there, current rating/hours/price, and the Google Maps link. Do NOT recommend a different place. Do NOT list new options.`;
+      return getTravelReply({ text: expandPrompt, userContext });
+    }
+    if (ordinalResponse.kind === 'clarify') {
+      return `I want to make sure I expand on the right one — could you tell me the name (or roughly which option) you meant? My last reply listed places, but I couldn't pin down which one corresponds to #${ordinalResponse.ordinal}.`;
+    }
+  }
 
   // Update context with detected info
   if (intent && !['greeting', 'help', 'thanks'].includes(intent)) {
@@ -662,7 +729,7 @@ async function handleTextMessage(text, userContext, isFirstEverMessage) {
   return getTravelReply({ text, userContext });
 }
 
-async function handleLocationMessage(location, userContext) {
+async function handleLocationMessage(location, userContext, userId) {
   if (!location || typeof location.degreesLatitude !== 'number') {
     return "I received a location but couldn't read the coordinates. Could you try sharing again?";
   }
@@ -686,6 +753,12 @@ async function handleLocationMessage(location, userContext) {
   // Update user context
   userContext.locationData = locationData;
   userContext.weather = weather;
+
+  // Persist IMMEDIATELY upon receipt. If the AI reply later fails or the bot
+  // crashes before sending, we must not lose the user's freshly-shared location.
+  if (userId) {
+    persistUserContext(userId, userContext);
+  }
 
   // Log weather if available
   if (weather) {
@@ -731,6 +804,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Mirror user context into both the short-lived session memory and the long-lived
+ * registry. Centralised so every save site captures the same fields.
+ */
+function persistUserContext(userId, userContext) {
+  userMemory.set(userId, userContext);
+  const currentRegistry = userRegistry.get(userId) || {};
+  userRegistry.set(userId, {
+    ...currentRegistry,
+    lastSeenAt: Date.now(),
+    savedPlaces: userContext.savedPlaces,
+    preferences: userContext.preferences,
+    travelStyle: userContext.travelStyle,
+    lastCity: userContext.lastCity,
+    locationData: userContext.locationData,
+    weather: userContext.weather,
+    lastTopic: userContext.lastTopic,
+    lastIntent: userContext.lastIntent,
+    // Persist conversation history so continuity survives restarts.
+    // MAX_CONVERSATION_HISTORY already caps the array length upstream.
+    conversationHistory: userContext.conversationHistory || [],
+  });
+}
+
 // =============================================================================
 // Express Health Server
 // =============================================================================
@@ -738,7 +835,7 @@ function sleep(ms) {
 const app = express();
 
 app.get('/', (req, res) => {
-  res.send('TravelBuddy WhatsApp Bot is running! 🌍');
+  res.send('Amiplore WhatsApp Bot is running! 🌍');
 });
 
 app.get('/health', (req, res) => {
@@ -765,12 +862,32 @@ app.get('/health', (req, res) => {
 async function shutdown(signal) {
   logger.info('Shutdown signal received', { signal });
 
+  // Render gives us 30s to exit cleanly. Hard-kill ourselves at 25s so we never
+  // trail beyond that window even if Baileys.logout() hangs on a dead socket.
+  const hardKill = setTimeout(() => {
+    logger.error('Shutdown took too long, forcing exit');
+    process.exit(1);
+  }, 25_000);
+  hardKill.unref();
+
+  // Persist FIRST so we never lose state to a hung sock.logout below.
+  try {
+    userRegistry.flushSync();
+    logger.info('User registry flushed', { users: userRegistry.size });
+  } catch (error) {
+    logger.error('Failed to flush user registry', { error: error.message });
+  }
+
   if (sock) {
     try {
-      await sock.logout();
+      // Bound the Baileys teardown so a broken connection can't stall us.
+      await Promise.race([
+        sock.logout(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('logout timeout')), 8000)),
+      ]);
       logger.info('WhatsApp socket closed');
     } catch (error) {
-      logger.error('Error closing socket', { error: error.message });
+      logger.warn('Socket close skipped', { error: error.message });
     }
   }
 
@@ -790,6 +907,8 @@ process.on('uncaughtException', (error) => {
     error: error.message,
     stack: error.stack,
   });
+  // Best-effort flush before crashing so we don't lose recent writes.
+  try { userRegistry.flushSync(); } catch (_) { /* already crashing */ }
   process.exit(1);
 });
 
@@ -804,12 +923,17 @@ process.on('unhandledRejection', (reason) => {
 // =============================================================================
 
 async function main() {
-  logger.info('Starting TravelBuddy WhatsApp Bot (Baileys)', {
+  logger.info('Starting Amiplore WhatsApp Bot (Baileys)', {
     nodeVersion: process.version,
     port: PORT,
     dataPath: DATA_PATH,
     cooldownMs: USER_COOLDOWN_MS,
   });
+
+  // Load persistent user state BEFORE serving any traffic so returning users
+  // are recognised on the very first message after a restart.
+  userRegistry.load();
+  logger.info('User registry loaded', { users: userRegistry.size });
 
   app.listen(PORT, '0.0.0.0', () => {
     logger.info('Health server listening', { port: PORT });
