@@ -7,6 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import PQueue from 'p-queue';
 import logger from '../util/logger.js';
 import { resolveTimezone, getTimezoneForCity } from '../util/cityTimezone.js';
+import { parseOptions } from '../util/optionParser.js';
 
 // Configuration
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -167,9 +168,10 @@ Direct, factual information:
 - Line breaks between recommendations
 - Maps links on their own line for easy clicking
 - No markdown headers (#)
-- Give exactly 3 fully detailed recommendations unless the user explicitly asks for more
-- COMPLETENESS RULE: every option must include name, area, price, rating, and a Maps link before you start the next one. Never start option 2 if option 1 isn't complete. Never start option 3 if option 2 isn't complete.
-- Hard limit ~3500 characters total. If you cannot fit 3 full options, give 2 complete options instead of 3 truncated ones. Better fewer-and-complete than many-and-cut.
+- Default to exactly 3 fully detailed recommendations.
+- IF the user EXPLICITLY asks for a different number ("give me 5", "list 4", "top 7"), HONOR that exact count. Do not silently fall back to 3.
+- COMPLETENESS RULE: every option must include name, area, price, rating, and a Maps link before you start the next one. Never start option 2 if option 1 isn't complete.
+- Hard limit ~3500 characters total. If a user asked for 5+ but you cannot fit them all in detail, condense each option (shorter description) so all of them appear — do NOT silently drop options or end at 3.
 - Never end mid-sentence, mid-link, or mid-option.
 - Keep responses scannable
 
@@ -311,20 +313,31 @@ function buildContext(userContext) {
     parts.push(`\n📝 RECENT CONVERSATION:`);
     const USER_CAP = 500;
     const ASSISTANT_CAP = 3500;
-    // Always include the most recent assistant reply IN FULL so ordinal references
-    // ("option 3", "the second one") can be resolved even if it falls outside the window.
     const history = userContext.conversationHistory;
     const recent = history.slice(-10);
-    // Find latest assistant message anywhere in history; if it's not already in recent, prepend.
-    let latestAssistantIdx = -1;
+
+    // Force-include the most recent assistant reply that contains a parseable
+    // list of options, even if it has fallen outside the recent-10 window.
+    // Without this, ordinal references like "tell me about option 3" fail
+    // whenever filler turns push the original list out of view.
+    let optionsReply = null;
     for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].role === 'assistant') { latestAssistantIdx = i; break; }
+      const msg = history[i];
+      if (msg.role !== 'assistant') continue;
+      try {
+        if (parseOptions(msg.text).length >= 2) {
+          optionsReply = msg;
+          break;
+        }
+      } catch (_) { /* parseOptions is defensive but never trust unknown input */ }
     }
-    const latestAssistantMsg = latestAssistantIdx >= 0 ? history[latestAssistantIdx] : null;
-    const latestInWindow = latestAssistantMsg && recent.includes(latestAssistantMsg);
-    if (latestAssistantMsg && !latestInWindow) {
-      parts.push(`You (earlier — kept for option references): ${latestAssistantMsg.text}`);
+    if (optionsReply && !recent.includes(optionsReply)) {
+      const fullText = optionsReply.text.length > ASSISTANT_CAP
+        ? optionsReply.text.substring(0, ASSISTANT_CAP) + '...'
+        : optionsReply.text;
+      parts.push(`You (earlier — preserved so the user can reference these by number): ${fullText}`);
     }
+
     recent.forEach(msg => {
       const role = msg.role === 'user' ? 'User' : 'You';
       const cap = msg.role === 'user' ? USER_CAP : ASSISTANT_CAP;
