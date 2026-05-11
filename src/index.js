@@ -750,6 +750,22 @@ async function handleLocationMessage(location, userContext, userId) {
   // Fetch weather for the location
   const weather = await getWeather(latitude, longitude);
 
+  // If the user has moved cities, the prior conversation history is stale —
+  // it would inject the OLD city's recommendations into every future prompt
+  // and the model would keep recommending places from the wrong city. Drop
+  // it. Saved places, preferences, and travelStyle stay (those are not
+  // location-specific to the same degree).
+  const oldCity = userContext.locationData?.city;
+  const newCity = locationData?.city;
+  const cityChanged = isUpdate && oldCity && newCity && oldCity.toLowerCase() !== newCity.toLowerCase();
+  if (cityChanged) {
+    logger.info('City changed, clearing conversation history', { oldCity, newCity });
+    userContext.conversationHistory = [];
+    userContext.lastTopic = null;
+    userContext.lastIntent = null;
+    userContext.lastCity = newCity;
+  }
+
   // Update user context
   userContext.locationData = locationData;
   userContext.weather = weather;

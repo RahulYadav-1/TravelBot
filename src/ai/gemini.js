@@ -57,12 +57,14 @@ const SYSTEM_PROMPT = `You are Amiplore - a professional, knowledgeable travel a
 For EVERY specific place you recommend, include a Google Maps link in this format:
 https://www.google.com/maps/search/?api=1&query=PLACE+NAME+CITY
 
-Example:
-"*Burma Burma* - Authentic Burmese cuisine
-📍 Kala Ghoda, Mumbai
-💰 ₹1500 for two
-⭐ 4.5/5
-https://www.google.com/maps/search/?api=1&query=Burma+Burma+Kala+Ghoda+Mumbai"
+The format (placeholders, not real places):
+"*[Place Name]* - [One-line description]
+📍 [Specific address]
+💰 [Local-currency price range]
+⭐ [Rating if known]
+https://www.google.com/maps/search/?api=1&query=[Place+Name]+[City]"
+
+⚠️ LOCATION ANCHOR: The user's CURRENT location is provided in the context above this section. ALWAYS use that exact city/area. NEVER recommend places from a different city, even if a previous turn discussed one. If the user is in London, recommend places in London — NOT Mumbai, NOT Delhi, NOT any other city.
 
 ### 3. INCLUDE BOOKING/REFERENCE LINKS WHEN POSSIBLE
 - Restaurants: Zomato/Swiggy/OpenTable links
@@ -181,30 +183,38 @@ Direct, factual information:
 - Never end mid-sentence, mid-link, or mid-option.
 - Keep responses scannable
 
-## EXAMPLES
+## EXAMPLES (illustrative format only — DO NOT copy these places; use the user's CURRENT city)
 
-User: "best restaurants in mumbai"
-Response:
-"Top dining recommendations in Mumbai:
+The structure to follow, with sample places from various cities so you understand the format:
 
-*Trishna* - Award-winning seafood
-📍 Fort, Mumbai
-💰 ₹3000 for two
+User in London: "best dinner spots"
+"Three top dinner spots in your area:
+
+*Dishoom Carnaby* - Bombay-inspired all-day dining
+📍 22 Kingly St, London W1B 5QP
+💰 £30-£50 per person
 ⭐ 4.6/5
-https://www.google.com/maps/search/?api=1&query=Trishna+Fort+Mumbai
+https://www.google.com/maps/search/?api=1&query=Dishoom+Carnaby+London"
 
-*Bademiya* - Iconic late-night kebabs
-📍 Colaba, Mumbai
-💰 ₹600 for two
-⭐ 4.3/5
-https://www.google.com/maps/search/?api=1&query=Bademiya+Colaba+Mumbai
+User in Bengaluru: "best dinner spots"
+"Three top dinner spots in your area:
 
-*Britannia & Co* - Heritage Parsi cuisine
-📍 Ballard Estate, Mumbai
-💰 ₹1200 for two
-⭐ 4.5/5
-🕐 Closes 4 PM (lunch only)
-https://www.google.com/maps/search/?api=1&query=Britannia+and+Co+Mumbai"
+*Toit Brewpub* - Lively microbrewery
+📍 100 Feet Rd, Indiranagar, Bengaluru
+💰 ₹2000 for two
+⭐ 4.4/5
+https://www.google.com/maps/search/?api=1&query=Toit+Brewpub+Indiranagar+Bengaluru"
+
+User in Tokyo: "best dinner spots"
+"Three top dinner spots in your area:
+
+*Gonpachi Shibuya* - Japanese cuisine with skyline views
+📍 14F E Space Tower, Shibuya, Tokyo
+💰 ¥4,000 for two
+🕐 11:30 AM - 3:30 AM
+https://www.google.com/maps/search/?api=1&query=Gonpachi+Shibuya+Tokyo"
+
+⚠️ The above are illustrative ONLY. Always recommend places ACTUALLY IN the user's current city as shown in LOCATION above. If the user's location is not Mumbai, do not output Mumbai-named places. If their city is not in the examples above, find places in THEIR city via Google Search.
 
 User: "hungry"
 Response:
@@ -280,16 +290,26 @@ function buildContext(userContext) {
   }
 
   // Location context — distinguish precise GPS share from a city the user mentioned.
+  // We also re-emphasise the location at the bottom of the prompt because the
+  // SYSTEM_PROMPT contains illustrative city examples and Gemini sometimes
+  // over-anchors on those if the location signal isn't repeated.
+  let activeCityForAnchor = null;
   if (userContext.locationData?.fullAddress) {
     parts.push(`📍 LOCATION (GPS-shared): ${userContext.locationData.fullAddress}`);
+    activeCityForAnchor = userContext.locationData.city || userContext.locationData.fullAddress;
     if (userContext.lastCity && userContext.lastCity.toLowerCase() !== (userContext.locationData.city || '').toLowerCase()) {
       parts.push(`🌐 ALSO ASKING ABOUT: ${userContext.lastCity}`);
+      activeCityForAnchor = userContext.lastCity;
     }
   } else if (userContext.lastCity) {
     parts.push(`📍 CITY (mentioned, not GPS): ${userContext.lastCity}`);
+    activeCityForAnchor = userContext.lastCity;
   } else {
-    parts.push(`📍 LOCATION: Not shared yet`);
+    parts.push(`📍 LOCATION: Not shared yet — ASK the user to share their location before recommending specific places.`);
   }
+
+  // Stash for the trailing anchor we add after history.
+  userContext._activeCityForAnchor = activeCityForAnchor;
 
   // Weather context
   if (userContext.weather) {
@@ -337,11 +357,23 @@ function buildContext(userContext) {
         }
       } catch (_) { /* parseOptions is defensive but never trust unknown input */ }
     }
+    // Only force-include the older options reply if it appears to be about the
+    // user's CURRENT city. If the user has switched cities since (e.g. they
+    // shared a new location), preserving an old Mumbai reply would mislead the
+    // model into recommending Mumbai places again.
     if (optionsReply && !recent.includes(optionsReply)) {
-      const fullText = optionsReply.text.length > ASSISTANT_CAP
-        ? optionsReply.text.substring(0, ASSISTANT_CAP) + '...'
-        : optionsReply.text;
-      parts.push(`You (earlier — preserved so the user can reference these by number): ${fullText}`);
+      const activeCity = activeCityForAnchor || '';
+      const replyMentionsActiveCity = activeCity
+        ? new RegExp(`\\b${activeCity.replace(/[^\w\s]/g, '').trim()}\\b`, 'i').test(optionsReply.text)
+        : true;
+      if (replyMentionsActiveCity) {
+        const fullText = optionsReply.text.length > ASSISTANT_CAP
+          ? optionsReply.text.substring(0, ASSISTANT_CAP) + '...'
+          : optionsReply.text;
+        parts.push(`You (earlier — preserved so the user can reference these by number): ${fullText}`);
+      } else {
+        parts.push(`(An older reply with options exists but it was about a different city than the user's current one — not including it. If the user references "option N" but this is the first list in the current city, ask them to clarify which list they mean.)`);
+      }
     }
 
     recent.forEach(msg => {
@@ -360,6 +392,13 @@ function buildContext(userContext) {
   // Last topic for continuity
   if (userContext.lastTopic) {
     parts.push(`\n💭 LAST TOPIC: ${userContext.lastTopic}`);
+  }
+
+  // Trailing location anchor — Gemini reads the END of the prompt with the
+  // freshest attention. Repeating the active city here defeats the gravitational
+  // pull of the example places in the SYSTEM_PROMPT.
+  if (activeCityForAnchor) {
+    parts.push(`\n📍 ACTIVE CITY FOR THIS REPLY: ${activeCityForAnchor}. Every recommendation MUST be in this city. Ignore any prior recommendations from a different city.`);
   }
 
   return parts.join('\n');
